@@ -1,0 +1,36 @@
+# ESC Passthrough - application Kconfig
+#
+# Copyright 2025 CogniPilot Foundation
+# Copyright 2025 NXP
+# SPDX-License-Identifier: Apache-2.0
+#
+# The FlexIO-UART transport is compiled app-privately (src/nxp_flexio_uart.c),
+# so the app owns its Kconfig symbols here instead of pulling in a shared
+# driver module. Mirrors the original cerebri driver Kconfig.
+
+config NXP_FLEXIO_UART
+	bool "NXP FlexIO UART (app-private ESC transport)"
+	default y
+	depends on DT_HAS_NXP_FLEXIO_UART_ENABLED
+	select MCUX_FLEXIO
+	help
+	  Single-wire half-duplex UART over the NXP FlexIO peripheral, used to
+	  talk to the AM32/BLHeli ESC bootloader. Compiled as application source
+	  (not a shared driver); binding lives in this app dts/bindings/.
+
+if NXP_FLEXIO_UART
+
+config NXP_FLEXIO_UART_INIT_PRIORITY
+	int "FlexIO UART init priority"
+	default 80
+	help
+	  Must be initialized after the FlexIO parent device.
+
+config NXP_FLEXIO_UART_LOG_LEVEL
+	int "FlexIO UART log level"
+	default 3
+	range 0 4
+
+endif # NXP_FLEXIO_UART
+
+source "Kconfig.zephyr"
