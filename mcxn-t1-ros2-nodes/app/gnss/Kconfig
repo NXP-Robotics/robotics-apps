@@ -1,0 +1,15 @@
+# Copyright 2026 NXP
+#
+# SPDX-License-Identifier: Apache-2.0
+
+mainmenu "MCXN-T1-GNSS"
+menu "Zephyr"
+source "Kconfig.zephyr"
+endmenu
+
+menu "GNSS"
+
+module = MCXN_T1_ROS2_GNSS
+module-str = mcxn_t1_ros2_gnss
+source "subsys/logging/Kconfig.template.log_config"
+endmenu

@@ -1,0 +1,46 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* Copyright 2025 CogniPilot Foundation */
+
+/*
+ * The AFBR-S50, PAA3905 and their FlexComm3/9 pinctrl are provided by the
+ * upstream `mr_mcxn_t1_optical_flow` shield (selected in CMakeLists.txt).
+ * Only application-specific aliases and overrides remain here.
+ */
+#include <zephyr/dt-bindings/sensor/afbr_s50.h>
+#include <zephyr/dt-bindings/sensor/icm45686.h>
+
+/ {
+	aliases {
+		imu-stream-0 = &icm45686_0;
+		optical-flow-stream-0 = &paa3905;
+		argus-stream-0 = &afbr_s50;
+	};
+};
+
+/* USB shell IRQ priority lower than SPI IRQs */
+&zephyr_udc0 {
+	interrupts = <0x43 0x6>;
+};
+
+/* AFBR-S50 SPI priority lower than the IMU running at 800-Hz */
+&flexcomm3 {
+	interrupts = <0x26 0x00>;
+};
+
+/* PAA3905 SPI priority lower than the IMU running at 800-Hz */
+&flexcomm9 {
+	interrupts = <0x2c 0x01>;
+};
+
+&icm45686_0 {
+	/* Configure to output 4-samples every 1.25-ms (800-Hz) */
+	accel-odr = <ICM45686_DT_ACCEL_ODR_3200>;
+	gyro-odr = <ICM45686_DT_GYRO_ODR_3200>;
+	fifo-watermark = <4>;
+	fifo-watermark-equals;
+};
+
+/* Application runs the ToF at 100-Hz (shield default is 50). */
+&afbr_s50 {
+	odr = <100>;
+};

@@ -1,0 +1,59 @@
+# Copyright (c) 2023 CogniPilot Foundation
+# SPDX-License-Identifier: Apache-2.0
+
+manifest:
+
+  group-filter:
+    - +optional
+
+  remotes:
+    - name: zephyrproject-rtos
+      url-base: https://github.com/zephyrproject-rtos
+    - name: cognipilot
+      url-base: https://github.com/CogniPilot
+    - name: nxp
+      url-base: ssh://git@bitbucket.sw.nxp.com/tars
+  projects:
+    - name: zephyr-rtos
+      remote: nxp
+      west-commands: scripts/west-commands.yml
+      revision: devel
+      path: zephyr
+      import:
+        - name-allowlist:
+          - nanopb
+          - mbedtls
+          - tf-psa-crypto
+          - hal_nxp
+          - hal_afbr
+          - hal_tdk
+          - cmsis
+          - cmsis_6
+          - cmsis-dsp
+          - fatfs
+          - segger
+          - mcuboot
+    - name: zros
+      remote: cognipilot
+      revision: 3f80b3ba8803abc02ad7382cc027658b05c07ca6
+      path: modules/lib/zros
+    - name: synapse_pb
+      remote: cognipilot
+      revision: 44ebbd1ed65ace0e9f8efcaa502f464c92faa78b # main 12/10/25
+      path: modules/lib/synapse_pb
+    - name: hal_afbr
+      remote: zephyrproject-rtos
+      revision: 1abf6947457380934e27f92508ec5532ddedfc6d # add-blobs-for-fpu
+      path: modules/hal/afbr
+    - name: zros_drivers
+      remote: cognipilot
+      revision: fb7e9982a96c30541f60815ab8994a1fcdfb8f55 # main 12/16/25
+      path: modules/lib/zros_drivers
+    - name: zenoh-pico
+      url: https://github.com/CogniPilot/zenoh-pico.git
+      revision: golden # PX4 CDR egress; TCP-only used here (no UDP-multicast/IPv6)
+      path: modules/lib/zenoh-pico
+    - name: microcdr
+      url: https://github.com/eProsima/Micro-CDR.git
+      revision: v2.0.1
+      path: modules/lib/microcdr

@@ -1,0 +1,15 @@
+# Copyright 2026 NXP
+#
+# SPDX-License-Identifier: Apache-2.0
+
+sample:
+  description: gnss
+  name: gnss
+common:
+  build_only: true
+tests:
+  gnss.mr_mcxn_t1/mcxn947/cpu0:
+    tags:
+      - gnss
+    integration_platforms:
+      - mr_mcxn_t1/mcxn947/cpu0

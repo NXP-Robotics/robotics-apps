@@ -1,0 +1,48 @@
+# Copyright (c) 2023, CogniPilot Foundation
+# SPDX-License-Identifier: Apache-2.0
+
+menuconfig SPINALI
+  bool "SPINALI"
+  default n
+  help
+    This option enables spinali builds
+
+if SPINALI
+
+menu "Version"
+
+config SPINALI_BOOT_BANNER
+  bool "spinali boot banner"
+  default y
+  help
+    Enable spinali boot banner
+
+config SPINALI_APP_NAME
+  string "spinali app name"
+  help
+    This spinali app name
+
+config SPINALI_VERSION_MAJOR
+  int "major version"
+  default 0
+  help
+    This spinali major version
+
+config SPINALI_VERSION_MINOR
+  int "minor version"
+  default 1
+  help
+    This spinali minor version
+
+config SPINALI_VERSION_PATCH
+  int "patch version"
+  default 0
+  help
+    This spinali patch version
+
+endmenu
+
+rsource "./lib/Kconfig"
+rsource "./drivers/Kconfig"
+
+endif #SPINALI

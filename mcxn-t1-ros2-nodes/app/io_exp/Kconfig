@@ -1,0 +1,15 @@
+# Copyright 2026 NXP
+#
+# SPDX-License-Identifier: Apache-2.0
+
+mainmenu "MCXN-T1-IO-EXP"
+menu "Zephyr"
+source "Kconfig.zephyr"
+endmenu
+
+menu "IO-EXP"
+
+module = MCXN_T1_ROS2_IO_EXP
+module-str = mcxn_t1_ros2_io_exp
+source "subsys/logging/Kconfig.template.log_config"
+endmenu

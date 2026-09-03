@@ -1,0 +1,243 @@
+# Copyright 2026 NXP
+#
+# SPDX-License-Identifier: Apache-2.0
+
+config SYNAPSE_ZENOH_PX4
+	bool "PX4 zenoh-pico CDR egress (rmw_zenoh /fmu/in/... keys)"
+	default n
+	depends on ZROS
+	select PX4_MSGS
+	select ZENOH_PICO
+	select ZENOH_PICO_PUBLICATION
+	select ZENOH_PICO_MULTI_THREAD
+	select ZENOH_PICO_LINK_TCP
+	help
+	  CDR-encoded px4_msgs egress over zenoh-pico to a PX4 (RT1176) target
+	  running the zenoh module. Each ZROS sample is mapped to the matching
+	  px4_msgs C struct (FLU->FRD, ns->us), serialized with Micro-CDR
+	  (00 01 00 00 encapsulation header + IDL-order body), and published on
+	  <ns>/fmu/in/<topic>[/RIHS01_<hash>].
+
+	  This is the CDR/rmw_zenoh replacement for the csyn synapse wire; leave
+	  SPINALI_SYNAPSE_CSYN and SPINALI_SYNAPSE_ZENOH off when this is on.
+
+if SYNAPSE_ZENOH_PX4
+
+choice
+	prompt "PX4 zenoh session mode"
+	default SYNAPSE_ZENOH_PX4_MODE_CLIENT
+	help
+	  Session topology, selected by build. The CDR wire payload is
+	  byte-identical in both; only the transport role and graph behaviour
+	  differ.
+
+	  CLIENT (client-server) is required when the peer is a zenoh router
+	  (rmw_zenohd) and this node must appear in the ROS2 graph (`ros2 topic
+	  list` / `node list`). The node is a CLIENT that CONNECTs to the router
+	  at LOCATOR. rmw_zenoh builds the graph from zenoh liveliness tokens
+	  under @ros2_lv/**, and every ros2 tool is a LATE JOINER because this
+	  node is always-on and boots first. As a CLIENT the router owns this
+	  session's tokens and replays them to late joiners on their liveliness
+	  queries and history subscriptions. A bare PEER cannot serve that path:
+	  zenoh-pico returns early from _z_interest_process_interest() on a
+	  unicast link ("Nothing to do on unicast"), so it never re-declares its
+	  tokens in response to a forwarded CURRENT|TOKENS Interest, and late
+	  joiners never learn its topics.
+
+	  PEER (peer-to-peer) is a direct, router-free unicast link to a plain
+	  zenoh-pico/PX4 endpoint where only the CDR payload matters. In this
+	  mode THIS NODE IS THE LISTENER: it opens a unicast peer transport and
+	  LISTENs on LOCATOR (a local bind address, e.g. tcp/0.0.0.0:7447), and
+	  PX4 is the CONNECTOR that dials in. PX4's zenoh glue only ever inserts
+	  MODE+CONNECT and cannot LISTEN, so the node must own the listen role;
+	  zenoh-pico provides it via Z_FEATURE_UNICAST_PEER + the LISTEN config
+	  key (both on by default in the pinned zenoh-pico). No ROS2 graph
+	  discovery.
+
+config SYNAPSE_ZENOH_PX4_MODE_PEER
+	bool "Peer-to-peer (node LISTENs, PX4 connects; no router)"
+
+config SYNAPSE_ZENOH_PX4_MODE_CLIENT
+	bool "Client-server (node connects to a zenoh router, e.g. rmw_zenohd)"
+
+endchoice
+
+
+config SYNAPSE_ZENOH_PX4_LOCATOR
+	string "Zenoh endpoint locator"
+	default "tcp/10.58.0.1:7447"
+	help
+	  In MODE_CLIENT this is the REMOTE endpoint this node CONNECTs to: the
+	  zenoh router (rmw_zenohd) listen address, e.g. tcp/<router_ip>:7447.
+
+	  In MODE_PEER this is the LOCAL bind address this node LISTENs on for
+	  the incoming PX4 connection, e.g. tcp/0.0.0.0:7447 (all interfaces) or
+	  tcp/<node_ip>:7447 (a specific interface). PX4 is then configured to
+	  CONNECT to tcp/<node_ip>:7447.
+
+	  Match the transport (TCP) the far side uses and keep batch/mtu params
+	  in agreement.
+
+
+config SYNAPSE_ZENOH_PX4_RUNTIME_CONFIG
+	bool "Runtime-configurable net mode + locator (shell, RAM only)"
+	default n
+	help
+	  When set, the session topology (peer/listen vs client/connect) and the
+	  locator are no longer fixed by the MODE_PEER/MODE_CLIENT choice and the
+	  LOCATOR string at build time; instead they become runtime parameters,
+	  mirroring PX4's `zenoh config net peer|client <ip>:<port>`. New shell
+	  commands are added under `zenoh_px4`:
+
+	    zenoh_px4 config net peer <ip>:<port>    (node LISTENs on this LOCAL addr)
+	    zenoh_px4 config net client <ip>:<port>  (CONNECT to a zenoh router)
+	    zenoh_px4 config show                    (print staged/active config)
+	    zenoh_px4 restart                        (reopen the session to apply)
+
+	  The MODE_* choice and LOCATOR value above are used as the initial
+	  power-on defaults. Changes are staged in RAM and applied on the next
+	  session open (explicit `restart`, not live).
+
+	  The runtime config is NOT persisted: a `config net` override is lost on
+	  reboot and the build defaults are restored. (An earlier revision saved
+	  it to NVS, but writing to the internal flash the CPU executes from
+	  stalled the shell thread on the XIP MCXN target during the flash
+	  program/erase, so persistence was removed.)
+
+	  NOTE the peer-mode semantic caveat: unlike PX4, where `net peer
+	  <ip>:<port>` is the REMOTE connect target, here peer mode makes the node
+	  the LISTENER, so the <ip>:<port> is this node's LOCAL bind/listen address
+	  (e.g. 0.0.0.0:7447). Client mode matches PX4: it is the remote router.
+
+config SYNAPSE_ZENOH_PX4_DOMAIN_ID
+	int "Zenoh/ROS2 domain id (must match PX4's ZENOH_DOMAIN_ID param)"
+	default 0
+	range 0 232
+	help
+	  PX4's zenoh module builds its key expression as
+	  <ZENOH_DOMAIN_ID><topic>/<type>/<hash-or-marker> (see
+	  generate_rmw_zenoh_topic_keyexpr() in PX4-Autopilot
+	  src/modules/zenoh/zenoh.cpp) -- the domain id is concatenated
+	  directly in front of the topic path with no separator of its own
+	  (the topic string supplies the leading '/'). This must equal the
+	  PX4-side ZENOH_DOMAIN_ID parameter (default 0) or every key will
+	  mismatch.
+
+config SYNAPSE_ZENOH_PX4_NAMESPACE
+	string "ROS2 namespace segment prepended to fmu/in/<topic>"
+	default ""
+	help
+	  Optional deployment namespace, mirroring rmw_zenoh's ROS_NAMESPACE.
+	  Empty publishes <domain_id>/fmu/in/<topic>/... Do not use leading or
+	  trailing slashes.
+
+	  NOTE: as of the PX4-Autopilot zenoh module reviewed for this driver,
+	  PX4's own key builder (generate_rmw_zenoh_topic_keyexpr()) has no
+	  namespace parameter -- its dds_topics.yaml topic strings are always
+	  the bare /fmu/in/<topic> form. Setting this to anything non-empty
+	  will therefore NOT match a stock PX4 zenoh module; it only matters
+	  when the peer is a generic rmw_zenoh/ROS2 node (or a PX4 fork that
+	  has been patched to prefix its topics). Leave empty for PX4.
+
+config SYNAPSE_ZENOH_PX4_RIHS_HASH
+	bool "Append RIHS01 type hash to the key expression"
+	default y
+	help
+	  Selects which of PX4's two key expression forms this bridge emits
+	  (see generate_rmw_zenoh_topic_keyexpr() in PX4-Autopilot
+	  src/modules/zenoh/zenoh.cpp):
+
+	    y: <domain_id><ns>/fmu/in/<topic>/px4_msgs::msg::dds_::<Type>_/RIHS01_<hex>
+	    n: <domain_id><ns>/fmu/in/<topic>/px4_msgs::msg::dds_::<Type>_/TypeHashNotSupported
+
+	  This must match PX4's CONFIG_ZENOH_KEY_TYPE_HASH build option
+	  exactly (y is the PX4 default, ROS2 Jazzy+); n only for a PX4 build
+	  configured for Humble-and-earlier-style keys.
+
+config SYNAPSE_ZENOH_PX4_RMW_COMPAT
+	bool "Emit rmw_zenoh liveliness tokens + per-sample attachments"
+	default n
+	help
+	  When set, the bridge additionally declares an rmw_zenoh liveliness
+	  token per topic (so the topic appears in `ros2 topic list`) and puts
+	  an rmw_zenoh-format attachment (sequence number, source timestamp,
+	  source GID) on every sample (so `ros2 topic echo` delivers it). This
+	  targets a generic ROS2 (rmw_zenoh) consumer, NOT stock PX4.
+
+	  Leave n for the PX4/RT1176 target: PX4 reads only the CDR payload and
+	  ignores both the attachment slot and liveliness tokens, so the wire
+	  payload is byte-identical either way; the extra bytes only cost
+	  bandwidth. The liveliness token keyexpr mangling and the attachment
+	  encoding are internal rmw_zenoh_cpp conventions, versioned per ROS
+	  distro (Jazzy assumed here). They MUST be matched against a reference
+	  Wireshark capture from a real rclcpp publisher; a mismatch fails
+	  silently (topic missing from `ros2 topic list`, or `ros2 topic echo`
+	  stays empty). See drivers/synapse/zenoh_px4/RMW_ZENOH_COMPAT.md.
+
+if SYNAPSE_ZENOH_PX4_RMW_COMPAT
+
+config SYNAPSE_ZENOH_PX4_RMW_NODE_NAME
+	string "ROS2 node name advertised in liveliness tokens"
+	default "spinali_t1"
+
+config SYNAPSE_ZENOH_PX4_RMW_NODE_NS
+	string "ROS2 node namespace advertised in liveliness tokens"
+	default "/"
+	help
+	  ROS2 namespace for the advertised node, e.g. "/" for the root
+	  namespace. Slashes are mangled to '%' in the token, matching
+	  rmw_zenoh.
+
+config SYNAPSE_ZENOH_PX4_RMW_ENCLAVE
+	string "ROS2 security enclave advertised in liveliness tokens"
+	default "%"
+	help
+	  Mangled enclave segment. Default "%" is rmw_zenoh's encoding of the
+	  root enclave "/".
+
+config SYNAPSE_ZENOH_PX4_RMW_QOS
+	string "rmw_zenoh QoS keyexpr segment for the published topics"
+	default "::,7:,:,:,,"
+	help
+	  The QoS segment rmw_zenoh appends to the publisher liveliness token.
+	  This format is version-specific and the single most fragile field;
+	  the entity is DROPPED from the ROS graph (topic absent from
+	  `ros2 topic list`) if it does not parse, even though the zenoh
+	  liveliness token itself is accepted by the router.
+
+	  The default below was copied VERBATIM from a ROS2 Jazzy `talker`
+	  (demo_nodes_cpp) chatter publisher token captured with
+	  scripts/rmw_zenoh_liveliness_dump.py; it encodes the rclcpp default
+	  publisher QoS (RELIABLE / VOLATILE / KEEP_LAST depth 7). The six
+	  comma-separated groups are, in order:
+	    <reliability>:<durability>,<history>:<depth>,<deadline>,<lifespan>,<liveliness+lease>
+	  with empty subfields meaning "system default / unspecified".
+
+	  Capture your own consumer's expected profile the same way and paste
+	  it here if you need best-effort or a different history/depth (a
+	  reliability mismatch will list the topic but prevent `ros2 topic
+	  echo` from subscribing). See RMW_ZENOH_COMPAT.md.
+
+endif # SYNAPSE_ZENOH_PX4_RMW_COMPAT
+
+config SYNAPSE_ZENOH_PX4_OPTICAL_FLOW_RATE_HZ
+	int "Optical flow publish rate cap (Hz, 0 = off, -1 = unlimited)"
+	default -1
+
+config SYNAPSE_ZENOH_PX4_DISTANCE_SENSOR_RATE_HZ
+	int "Distance sensor publish rate cap (Hz, 0 = off, -1 = unlimited)"
+	default -1
+
+config SYNAPSE_ZENOH_PX4_GNSS_RATE_HZ
+	int "Sensor GPS publish rate cap (Hz, 0 = off, -1 = unlimited)"
+	default 25
+
+config SYNAPSE_ZENOH_PX4_MAG_RATE_HZ
+	int "Sensor mag publish rate cap (Hz, 0 = off, -1 = unlimited)"
+	default 50
+
+module = SYNAPSE_ZENOH_PX4
+module-str = synapse_zenoh_px4
+source "subsys/logging/Kconfig.template.log_config"
+
+endif # SYNAPSE_ZENOH_PX4

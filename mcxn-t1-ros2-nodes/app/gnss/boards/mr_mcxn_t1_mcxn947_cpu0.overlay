@@ -1,0 +1,58 @@
+/*
+ * Copyright 2026 NXP
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * The F9P GNSS node, its FlexComm7/LPUART7 pinctrl and the `gnss` alias
+ * are provided by the upstream `mr_mcxn_t1_f9p` shield (selected in
+ * CMakeLists.txt). Only application-specific overrides remain here.
+ */
+#include <zephyr/dt-bindings/input/input-event-codes.h>
+#include <zephyr/dt-bindings/sensor/icm45686.h>
+
+/ {
+	aliases {
+		imu-stream-0 = &icm45686_0;
+	};
+};
+
+/* USB shell IRQ priority lower than the sensor IRQs */
+&zephyr_udc0 {
+	interrupts = <0x43 0x6>;
+};
+
+&icm45686_0 {
+	accel-odr = <ICM45686_DT_ACCEL_ODR_3200>;
+	gyro-odr = <ICM45686_DT_GYRO_ODR_3200>;
+	fifo-watermark = <4>;
+	fifo-watermark-equals;
+};
+
+/* Application wants a 100 ms fix rate (shield default is 1000). */
+&gnss1 {
+	fix-rate = <100>;
+};
+
+/ {
+	gpio_keys {
+		compatible = "gpio-keys";
+		button_sw1: button_sw1 {
+			gpios = <&gpio1 2 GPIO_ACTIVE_LOW>;
+			label = "SW1";
+			zephyr,code = <INPUT_KEY_0>;
+		};
+		button_sw2: button_sw2 {
+			gpios = <&gpio1 3 GPIO_ACTIVE_LOW>;
+			label = "SW2";
+			zephyr,code = <INPUT_KEY_1>;
+		};
+	};
+
+	gnss_leds {
+		compatible = "gpio-leds";
+		led_gpsfix: led_gpsfix {
+			gpios = <&gpio3 9 GPIO_ACTIVE_HIGH>;
+			label = "GPSFIX";
+		};
+	};
+};

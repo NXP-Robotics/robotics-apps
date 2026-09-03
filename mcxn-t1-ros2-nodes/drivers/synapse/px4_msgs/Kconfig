@@ -1,0 +1,16 @@
+# Copyright 2026 NXP
+#
+# SPDX-License-Identifier: Apache-2.0
+
+config PX4_MSGS
+	bool "px4_msgs C mirror with micro-CDR encoders"
+	default n
+	help
+	  Hand-written C structs and micro-CDR encoders that mirror a pinned
+	  subset of PX4/px4_msgs (SensorOpticalFlow, DistanceSensor, SensorGps,
+	  SensorMag). Wire payload is the 4-byte CDR encapsulation header
+	  00 01 00 00 followed by the CDR body in IDL field order, with the
+	  RIHS01 type hash carried in the rmw_zenoh key expression.
+
+	  Selecting this pulls in eProsima Micro-CDR from the microcdr west
+	  project and builds it as a Zephyr library.

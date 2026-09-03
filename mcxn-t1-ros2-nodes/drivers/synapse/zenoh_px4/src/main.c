@@ -1,0 +1,1084 @@
+/*
+ * Copyright 2026 NXP
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#include <errno.h>
+#include <math.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+
+#include <zephyr/devicetree.h>
+#include <zephyr/kernel.h>
+#include <zephyr/logging/log.h>
+#include <zephyr/shell/shell.h>
+#include <zephyr/sys/util.h>
+
+#include <zros/private/zros_node_struct.h>
+#include <zros/private/zros_pub_struct.h>
+#include <zros/private/zros_sub_struct.h>
+#include <zros/zros_node.h>
+#include <zros/zros_pub.h>
+#include <zros/zros_sub.h>
+
+#include <zenoh-pico.h>
+
+#include <ucdr/microcdr.h>
+
+#include <synapse_topic_list.h>
+
+#include <synapse_pb/argus_results.pb.h>
+#include <synapse_pb/magnetic_field.pb.h>
+#include <synapse_pb/nav_sat_fix.pb.h>
+#include <synapse_pb/pixart_paa3905.pb.h>
+
+#include <px4_msgs_c/distance_sensor.h>
+#include <px4_msgs_c/sensor_gps.h>
+#include <px4_msgs_c/sensor_mag.h>
+#include <px4_msgs_c/sensor_optical_flow.h>
+#include <px4_msgs_c/type_hashes.h>
+
+LOG_MODULE_REGISTER(synapse_zenoh_px4, CONFIG_SYNAPSE_ZENOH_PX4_LOG_LEVEL);
+
+
+#define MY_STACK_SIZE 8192
+#define MY_PRIORITY   5
+#define KEYEXPR_MAX   200
+#define CDR_BUF_MAX   256U
+#define POLL_MS       50
+#define DIST_MIN_M 0.08f
+#define DIST_MAX_M 30.0f
+
+/* CDR/ROS2 media type used on every publisher-put. */
+#define CDR_ENCODING_STR "application/octet-stream;encoding=cdr"
+
+#if (CONFIG_SYNAPSE_ZENOH_PX4_OPTICAL_FLOW_RATE_HZ != 0)
+#define BRIDGE_TX_OPTICAL_FLOW 1
+#else
+#define BRIDGE_TX_OPTICAL_FLOW 0
+#endif
+
+#if (CONFIG_SYNAPSE_ZENOH_PX4_DISTANCE_SENSOR_RATE_HZ != 0)
+#define BRIDGE_TX_DISTANCE_SENSOR 1
+#else
+#define BRIDGE_TX_DISTANCE_SENSOR 0
+#endif
+
+#if (CONFIG_SYNAPSE_ZENOH_PX4_GNSS_RATE_HZ != 0)
+#define BRIDGE_TX_SENSOR_GPS 1
+#else
+#define BRIDGE_TX_SENSOR_GPS 0
+#endif
+
+#if (CONFIG_SYNAPSE_ZENOH_PX4_MAG_RATE_HZ != 0)
+#define BRIDGE_TX_SENSOR_MAG 1
+#else
+#define BRIDGE_TX_SENSOR_MAG 0
+#endif
+
+#define BRIDGE_TX_COUNT                                                                            \
+	(BRIDGE_TX_OPTICAL_FLOW + BRIDGE_TX_DISTANCE_SENSOR + BRIDGE_TX_SENSOR_GPS +                \
+	 BRIDGE_TX_SENSOR_MAG)
+
+static K_THREAD_STACK_DEFINE(g_stack, MY_STACK_SIZE);
+
+struct context {
+	struct zros_node node;
+
+#if BRIDGE_TX_OPTICAL_FLOW
+	synapse_pb_PixartPAA3905        z_flow;
+	px4_msgs_c_SensorOpticalFlow_t  p_flow;
+	uint8_t                         cdr_flow[CDR_BUF_MAX];
+#endif
+#if BRIDGE_TX_DISTANCE_SENSOR
+	synapse_pb_ArgusResults         z_dist_src; /* range comes from argus bin */
+	px4_msgs_c_DistanceSensor_t     p_dist;
+	uint8_t                         cdr_dist[CDR_BUF_MAX];
+#endif
+#if BRIDGE_TX_SENSOR_GPS
+	synapse_pb_NavSatFix            z_gnss;
+	px4_msgs_c_SensorGps_t          p_gps;
+	uint8_t                         cdr_gps[CDR_BUF_MAX];
+#endif
+#if BRIDGE_TX_SENSOR_MAG
+	synapse_pb_MagneticField        z_mag;
+	px4_msgs_c_SensorMag_t          p_mag;
+	uint8_t                         cdr_mag[CDR_BUF_MAX];
+#endif
+
+	z_owned_session_t sessions[1];
+
+#if IS_ENABLED(CONFIG_SYNAPSE_ZENOH_PX4_RMW_COMPAT)
+	uint8_t          source_gid[16];
+	char             zid_hex[33]; /* 32 hex chars + NUL */
+	z_owned_liveliness_token_t node_token;
+	bool rmw_declared;
+#endif
+
+
+	struct k_sem     running;
+	struct k_thread  thread_data;
+};
+
+static struct context g_ctx = {
+	.running = Z_SEM_INITIALIZER(g_ctx.running, 1, 1),
+};
+
+#if IS_ENABLED(CONFIG_SYNAPSE_ZENOH_PX4_RUNTIME_CONFIG)
+
+enum zpx4_mode {
+	ZPX4_MODE_PEER = 0,   /* node LISTENs, PX4 connects */
+	ZPX4_MODE_CLIENT = 1, /* node CONNECTs to a zenoh router */
+};
+
+#define ZPX4_LOCATOR_MAX 64
+
+struct zpx4_run_cfg {
+	char    locator[ZPX4_LOCATOR_MAX];
+	uint8_t mode; /* enum zpx4_mode */
+};
+
+static struct zpx4_run_cfg g_run_cfg = {
+	.locator = CONFIG_SYNAPSE_ZENOH_PX4_LOCATOR,
+#if defined(CONFIG_SYNAPSE_ZENOH_PX4_MODE_PEER)
+	.mode = ZPX4_MODE_PEER,
+#else
+	.mode = ZPX4_MODE_CLIENT,
+#endif
+};
+
+#endif /* CONFIG_SYNAPSE_ZENOH_PX4_RUNTIME_CONFIG */
+
+
+/* -------- map functions: ZROS payload -> px4 struct -------- */
+
+static inline uint64_t stamp_to_us(const synapse_pb_Timestamp *ts)
+{
+	int64_t sec = ts->seconds;
+	int64_t nsec = ts->nanos;
+
+	sec += nsec / 1000000000;
+	nsec %= 1000000000;
+	if (nsec < 0) {
+		nsec += 1000000000;
+		sec -= 1;
+	}
+	if (sec < 0) {
+		return 0;
+	}
+	return (uint64_t)sec * 1000000ULL + (uint64_t)nsec / 1000ULL;
+}
+
+
+#if BRIDGE_TX_OPTICAL_FLOW
+
+static uint8_t px4_flow_mode_from_pb(uint32_t pb_mode)
+{
+	switch (pb_mode) {
+	case 0:
+		return PX4_MSGS_C_OPTICAL_FLOW_MODE_BRIGHT;
+	case 1:
+		return PX4_MSGS_C_OPTICAL_FLOW_MODE_LOWLIGHT;
+	case 2:
+		return PX4_MSGS_C_OPTICAL_FLOW_MODE_SUPER_LOWLIGHT;
+	default:
+		return PX4_MSGS_C_OPTICAL_FLOW_MODE_UNKNOWN;
+	}
+}
+
+static void map_optical_flow(const synapse_pb_PixartPAA3905 *z,
+			     px4_msgs_c_SensorOpticalFlow_t *p)
+{
+	memset(p, 0, sizeof(*p));
+
+	if (z->has_stamp) {
+		p->timestamp        = stamp_to_us(&z->stamp);
+		p->timestamp_sample = p->timestamp;
+	}
+	p->device_id = 0;
+
+	p->pixel_flow[0] = (float)z->delta_x;
+	p->pixel_flow[1] = -(float)z->delta_y;
+
+	p->delta_angle[0]        = 0.0f;
+	p->delta_angle[1]        = 0.0f;
+	p->delta_angle[2]        = 0.0f;
+	p->delta_angle_available = false;
+
+	p->distance_m              = 0.0f;
+	p->distance_available      = false;
+	p->integration_timespan_us = 0;
+	p->quality                 = (uint8_t)MIN(z->squal, 255U);
+	p->error_count             = 0;
+	p->max_flow_rate           = 0.0f;
+	p->min_ground_distance     = 0.0f;
+	p->max_ground_distance     = 0.0f;
+	p->mode                    = px4_flow_mode_from_pb(z->mode);
+}
+#endif /* BRIDGE_TX_OPTICAL_FLOW */
+
+#if BRIDGE_TX_DISTANCE_SENSOR
+static void map_distance_sensor(const synapse_pb_ArgusResults *z,
+				px4_msgs_c_DistanceSensor_t *p)
+{
+	memset(p, 0, sizeof(*p));
+
+	if (z->has_stamp) {
+		p->timestamp = stamp_to_us(&z->stamp);
+	}
+	p->device_id        = 0;
+	p->min_distance     = DIST_MIN_M;
+	p->max_distance     = DIST_MAX_M;
+	p->current_distance = z->has_bin ? z->bin.range : 0.0f;
+	p->variance         = 0.0f;
+	p->signal_quality   = z->has_bin ? (int8_t)MIN(z->bin.signal_quality, 100U) : (int8_t)-1;
+	p->type             = PX4_MSGS_C_DISTANCE_SENSOR_TYPE_LASER;
+	p->h_fov            = 0.0f;
+	p->v_fov            = 0.0f;
+	p->q[0]             = 1.0f;
+	p->q[1]             = 0.0f;
+	p->q[2]             = 0.0f;
+	p->q[3]             = 0.0f;
+	p->orientation      = PX4_MSGS_C_ROTATION_DOWNWARD_FACING;
+	p->mode             = PX4_MSGS_C_DISTANCE_SENSOR_MODE_ENABLED;
+}
+#endif
+
+#if BRIDGE_TX_SENSOR_GPS
+static bool gps_sample_valid(const px4_msgs_c_SensorGps_t *p)
+{
+	if (p->fix_type < PX4_MSGS_C_GPS_FIX_TYPE_2D) {
+		return false;
+	}
+
+	if (!isfinite(p->latitude_deg) || !isfinite(p->longitude_deg) ||
+	    !isfinite(p->altitude_msl_m)) {
+		return false;
+	}
+	if (p->latitude_deg < -90.0 || p->latitude_deg > 90.0 ||
+	    p->longitude_deg < -180.0 || p->longitude_deg > 180.0) {
+		return false;
+	}
+
+	if (p->latitude_deg == 0.0 && p->longitude_deg == 0.0) {
+		return false;
+	}
+	return true;
+}
+
+
+static void map_sensor_gps(const synapse_pb_NavSatFix *z, px4_msgs_c_SensorGps_t *p)
+{
+	memset(p, 0, sizeof(*p));
+
+	if (z->has_stamp) {
+		p->timestamp        = stamp_to_us(&z->stamp);
+		p->timestamp_sample = p->timestamp;
+	}
+	p->device_id = 0;
+
+	p->latitude_deg         = z->latitude;
+	p->longitude_deg        = z->longitude;
+	p->altitude_msl_m       = z->altitude;
+	p->altitude_ellipsoid_m = z->altitude;
+
+	p->fix_type = PX4_MSGS_C_GPS_FIX_TYPE_3D;
+
+
+	if (z->has_position_covariance) {
+		const float ch = (float)z->position_covariance.x_x;
+		const float cv = (float)z->position_covariance.z_z;
+		p->eph = ch > 0.0f ? sqrtf(ch) : 0.0f;
+		p->epv = cv > 0.0f ? sqrtf(cv) : 0.0f;
+	}
+
+	p->s_variance_m_s = 0.0f;
+	p->c_variance_rad = 0.0f;
+	p->hdop           = 0.0f;
+	p->vdop           = 0.0f;
+	p->vel_ned_valid  = false;
+	p->heading        = NAN;
+	p->jamming_state    = PX4_MSGS_C_JAMMING_STATE_UNKNOWN;
+	p->spoofing_state   = PX4_MSGS_C_SPOOFING_STATE_UNKNOWN;
+	p->authentication_state = PX4_MSGS_C_AUTHENTICATION_STATE_UNKNOWN;
+}
+#endif
+
+#if BRIDGE_TX_SENSOR_MAG
+static void map_sensor_mag(const synapse_pb_MagneticField *z, px4_msgs_c_SensorMag_t *p)
+{
+	memset(p, 0, sizeof(*p));
+
+	if (z->has_stamp) {
+		p->timestamp        = stamp_to_us(&z->stamp);
+		p->timestamp_sample = p->timestamp;
+	}
+	p->device_id = 0;
+
+	/* Tesla -> Gauss: 1 T = 1e4 G. FLU (x fwd, y left, z up) -> FRD on axes. */
+	if (z->has_magnetic_field) {
+		p->x = (float)z->magnetic_field.x * 1.0e4f;
+		p->y = -(float)z->magnetic_field.y * 1.0e4f;
+		p->z = -(float)z->magnetic_field.z * 1.0e4f;
+	}
+	p->temperature = 0.0f;
+	p->error_count = 0;
+}
+#endif
+
+/* -------- topic table row -------- */
+
+struct tx_row {
+	struct zros_topic *ztopic;
+	void              *zbuf;        /* ZROS scratch */
+	void              *pbuf;        /* px4 struct scratch */
+	uint8_t           *cdr_buf;
+	size_t             cdr_size;
+	void             (*map_fn)(const void *zsrc, void *pdst);
+	int              (*encode_fn)(struct ucdrBuffer *ub, const void *pdst);
+	bool             (*valid_fn)(const void *pdst);
+	const char        *topic_leaf; /* "sensor_optical_flow" */
+	const char        *ros_type;   /* "px4_msgs::msg::dds_::SensorOpticalFlow_" */
+	const char        *rihs_hash;  /* full "RIHS01_..." */
+	int32_t            rate_hz;
+	z_owned_publisher_t publisher;
+#if IS_ENABLED(CONFIG_SYNAPSE_ZENOH_PX4_RMW_COMPAT)
+	int64_t                    seq;   /* rmw_zenoh per-publisher sample counter */
+	uint32_t                   eid;   /* rmw_zenoh entity id (unique per row) */
+	z_owned_liveliness_token_t token; /* graph-discovery liveliness token */
+#endif
+};
+
+/* Thin wrappers so the void* map_fn/encode_fn table stays type-clean. */
+#if BRIDGE_TX_OPTICAL_FLOW
+static void map_flow_thunk(const void *z, void *p)
+{
+	map_optical_flow((const synapse_pb_PixartPAA3905 *)z,
+			 (px4_msgs_c_SensorOpticalFlow_t *)p);
+}
+static int enc_flow_thunk(struct ucdrBuffer *ub, const void *p)
+{
+	return px4_msgs_c_encode_sensor_optical_flow(ub,
+			(const px4_msgs_c_SensorOpticalFlow_t *)p);
+}
+#endif
+#if BRIDGE_TX_DISTANCE_SENSOR
+static void map_dist_thunk(const void *z, void *p)
+{
+	map_distance_sensor((const synapse_pb_ArgusResults *)z,
+			    (px4_msgs_c_DistanceSensor_t *)p);
+}
+static int enc_dist_thunk(struct ucdrBuffer *ub, const void *p)
+{
+	return px4_msgs_c_encode_distance_sensor(ub,
+			(const px4_msgs_c_DistanceSensor_t *)p);
+}
+#endif
+#if BRIDGE_TX_SENSOR_GPS
+static void map_gps_thunk(const void *z, void *p)
+{
+	map_sensor_gps((const synapse_pb_NavSatFix *)z,
+		       (px4_msgs_c_SensorGps_t *)p);
+}
+static int enc_gps_thunk(struct ucdrBuffer *ub, const void *p)
+{
+	return px4_msgs_c_encode_sensor_gps(ub, (const px4_msgs_c_SensorGps_t *)p);
+}
+static bool valid_gps_thunk(const void *p)
+{
+	return gps_sample_valid((const px4_msgs_c_SensorGps_t *)p);
+}
+#endif
+#if BRIDGE_TX_SENSOR_MAG
+static void map_mag_thunk(const void *z, void *p)
+{
+	map_sensor_mag((const synapse_pb_MagneticField *)z,
+		       (px4_msgs_c_SensorMag_t *)p);
+}
+static int enc_mag_thunk(struct ucdrBuffer *ub, const void *p)
+{
+	return px4_msgs_c_encode_sensor_mag(ub, (const px4_msgs_c_SensorMag_t *)p);
+}
+#endif
+
+#if BRIDGE_TX_COUNT > 0
+static struct tx_row tx_table[] = {
+#if BRIDGE_TX_OPTICAL_FLOW
+	{
+		.ztopic     = &topic_optical_flow_raw,
+		.zbuf       = &g_ctx.z_flow,
+		.pbuf       = &g_ctx.p_flow,
+		.cdr_buf    = g_ctx.cdr_flow,
+		.cdr_size   = sizeof(g_ctx.cdr_flow),
+		.map_fn     = map_flow_thunk,
+		.encode_fn  = enc_flow_thunk,
+		.topic_leaf = PX4_MSGS_C_TOPIC_SENSOR_OPTICAL_FLOW,
+		.ros_type   = PX4_MSGS_C_ROS_TYPE_SENSOR_OPTICAL_FLOW,
+		.rihs_hash  = PX4_MSGS_C_RIHS_SENSOR_OPTICAL_FLOW,
+		.rate_hz    = CONFIG_SYNAPSE_ZENOH_PX4_OPTICAL_FLOW_RATE_HZ,
+	},
+#endif
+#if BRIDGE_TX_DISTANCE_SENSOR
+	{
+		.ztopic     = &topic_argus,
+		.zbuf       = &g_ctx.z_dist_src,
+		.pbuf       = &g_ctx.p_dist,
+		.cdr_buf    = g_ctx.cdr_dist,
+		.cdr_size   = sizeof(g_ctx.cdr_dist),
+		.map_fn     = map_dist_thunk,
+		.encode_fn  = enc_dist_thunk,
+		.topic_leaf = PX4_MSGS_C_TOPIC_DISTANCE_SENSOR,
+		.ros_type   = PX4_MSGS_C_ROS_TYPE_DISTANCE_SENSOR,
+		.rihs_hash  = PX4_MSGS_C_RIHS_DISTANCE_SENSOR,
+		.rate_hz    = CONFIG_SYNAPSE_ZENOH_PX4_DISTANCE_SENSOR_RATE_HZ,
+	},
+#endif
+#if BRIDGE_TX_SENSOR_GPS
+	{
+		.ztopic     = &topic_nav_sat_fix,
+		.zbuf       = &g_ctx.z_gnss,
+		.pbuf       = &g_ctx.p_gps,
+		.cdr_buf    = g_ctx.cdr_gps,
+		.cdr_size   = sizeof(g_ctx.cdr_gps),
+		.map_fn     = map_gps_thunk,
+		.encode_fn  = enc_gps_thunk,
+		.valid_fn   = valid_gps_thunk,
+		.topic_leaf = PX4_MSGS_C_TOPIC_SENSOR_GPS,
+		.ros_type   = PX4_MSGS_C_ROS_TYPE_SENSOR_GPS,
+		.rihs_hash  = PX4_MSGS_C_RIHS_SENSOR_GPS,
+		.rate_hz    = CONFIG_SYNAPSE_ZENOH_PX4_GNSS_RATE_HZ,
+	},
+#endif
+#if BRIDGE_TX_SENSOR_MAG
+	{
+		.ztopic     = &topic_magnetic_field,
+		.zbuf       = &g_ctx.z_mag,
+		.pbuf       = &g_ctx.p_mag,
+		.cdr_buf    = g_ctx.cdr_mag,
+		.cdr_size   = sizeof(g_ctx.cdr_mag),
+		.map_fn     = map_mag_thunk,
+		.encode_fn  = enc_mag_thunk,
+		.topic_leaf = PX4_MSGS_C_TOPIC_SENSOR_MAG,
+		.ros_type   = PX4_MSGS_C_ROS_TYPE_SENSOR_MAG,
+		.rihs_hash  = PX4_MSGS_C_RIHS_SENSOR_MAG,
+		.rate_hz    = CONFIG_SYNAPSE_ZENOH_PX4_MAG_RATE_HZ,
+	},
+#endif
+};
+BUILD_ASSERT(ARRAY_SIZE(tx_table) == BRIDGE_TX_COUNT);
+static struct zros_sub tx_subs[BRIDGE_TX_COUNT];
+
+#if BRIDGE_TX_OPTICAL_FLOW
+BUILD_ASSERT(CDR_BUF_MAX >= PX4_MSGS_C_SENSOR_OPTICAL_FLOW_CDR_MAX,
+	     "CDR_BUF_MAX too small for SensorOpticalFlow");
+#endif
+#if BRIDGE_TX_DISTANCE_SENSOR
+BUILD_ASSERT(CDR_BUF_MAX >= PX4_MSGS_C_DISTANCE_SENSOR_CDR_MAX,
+	     "CDR_BUF_MAX too small for DistanceSensor");
+#endif
+#if BRIDGE_TX_SENSOR_GPS
+BUILD_ASSERT(CDR_BUF_MAX >= PX4_MSGS_C_SENSOR_GPS_CDR_MAX,
+	     "CDR_BUF_MAX too small for SensorGps");
+#endif
+#if BRIDGE_TX_SENSOR_MAG
+BUILD_ASSERT(CDR_BUF_MAX >= PX4_MSGS_C_SENSOR_MAG_CDR_MAX,
+	     "CDR_BUF_MAX too small for SensorMag");
+#endif
+#endif /* BRIDGE_TX_COUNT > 0 */
+
+#define PX4_MSGS_C_TYPE_HASH_NOT_SUPPORTED "TypeHashNotSupported"
+
+static int build_keyexpr(char *out, size_t out_size, const char *topic_leaf,
+			 const char *ros_type, const char *rihs_hash)
+{
+	const char *ns = CONFIG_SYNAPSE_ZENOH_PX4_NAMESPACE;
+	const int domain_id = CONFIG_SYNAPSE_ZENOH_PX4_DOMAIN_ID;
+	int len;
+
+#if IS_ENABLED(CONFIG_SYNAPSE_ZENOH_PX4_RIHS_HASH)
+	const char *hash_seg = rihs_hash;
+#else
+	const char *hash_seg = PX4_MSGS_C_TYPE_HASH_NOT_SUPPORTED;
+	ARG_UNUSED(rihs_hash);
+#endif
+
+	if (ns[0] != '\0') {
+		len = snprintf(out, out_size, "%d/%s/fmu/in/%s/%s/%s", domain_id, ns,
+			       topic_leaf, ros_type, hash_seg);
+	} else {
+		len = snprintf(out, out_size, "%d/fmu/in/%s/%s/%s", domain_id, topic_leaf,
+			       ros_type, hash_seg);
+	}
+
+	return (len > 0 && (size_t)len < out_size) ? 0 : -EINVAL;
+}
+
+#if IS_ENABLED(CONFIG_SYNAPSE_ZENOH_PX4_RMW_COMPAT)
+
+#define RMW_LIVELINESS_KEYEXPR_MAX 512
+
+static inline bool rmw_compat_active(void)
+{
+#if IS_ENABLED(CONFIG_SYNAPSE_ZENOH_PX4_RUNTIME_CONFIG)
+	return g_run_cfg.mode == ZPX4_MODE_CLIENT;
+#elif defined(CONFIG_SYNAPSE_ZENOH_PX4_MODE_CLIENT)
+	return true;
+#else
+	return false;
+#endif
+}
+
+/* rmw_zenoh keyexpr-mangles '/' in names to '%'. Copy src into dst applying
+ * that substitution; dst must hold strlen(src)+1 bytes. */
+static void rmw_mangle_name(char *dst, size_t dst_size, const char *src)
+{
+	size_t j = 0;
+
+	for (size_t i = 0; src[i] != '\0' && j + 1 < dst_size; i++) {
+		dst[j++] = (src[i] == '/') ? '%' : src[i];
+	}
+	dst[j] = '\0';
+}
+
+static void rmw_capture_source_gid(struct context *ctx)
+{
+	z_id_t zid = z_info_zid(z_loan(ctx->sessions[0]));
+
+	BUILD_ASSERT(sizeof(zid.id) == sizeof(ctx->source_gid));
+	memcpy(ctx->source_gid, zid.id, sizeof(ctx->source_gid));
+
+	static const char hexd[] = "0123456789abcdef";
+	for (size_t i = 0; i < sizeof(zid.id); i++) {
+		ctx->zid_hex[2 * i]     = hexd[(zid.id[i] >> 4) & 0xF];
+		ctx->zid_hex[2 * i + 1] = hexd[zid.id[i] & 0xF];
+	}
+	ctx->zid_hex[2 * sizeof(zid.id)] = '\0';
+}
+
+static int rmw_build_liveliness_keyexpr(char *out, size_t out_size, struct context *ctx,
+					const struct tx_row *row)
+{
+	char topic_full[96];
+	char topic_mangled[96];
+	char type_mangled[128];
+	const char *node_ns = CONFIG_SYNAPSE_ZENOH_PX4_RMW_NODE_NS;
+	const char *node_name = CONFIG_SYNAPSE_ZENOH_PX4_RMW_NODE_NAME;
+	const char *enclave = CONFIG_SYNAPSE_ZENOH_PX4_RMW_ENCLAVE;
+	const char *qos = CONFIG_SYNAPSE_ZENOH_PX4_RMW_QOS;
+	char node_ns_mangled[64];
+	int len;
+
+#if IS_ENABLED(CONFIG_SYNAPSE_ZENOH_PX4_RIHS_HASH)
+	const char *type_hash = row->rihs_hash;
+#else
+	const char *type_hash = PX4_MSGS_C_TYPE_HASH_NOT_SUPPORTED;
+#endif
+
+	(void)snprintf(topic_full, sizeof(topic_full), "/fmu/in/%s", row->topic_leaf);
+	rmw_mangle_name(topic_mangled, sizeof(topic_mangled), topic_full);
+	rmw_mangle_name(type_mangled, sizeof(type_mangled), row->ros_type);
+	rmw_mangle_name(node_ns_mangled, sizeof(node_ns_mangled), node_ns);
+
+	len = snprintf(out, out_size,
+		       "@ros2_lv/%d/%s/0/%u/MP/%s/%s/%s/%s/%s/%s/%s",
+		       CONFIG_SYNAPSE_ZENOH_PX4_DOMAIN_ID, ctx->zid_hex, row->eid,
+		       enclave, node_ns_mangled, node_name, topic_mangled, type_mangled,
+		       type_hash, qos);
+
+	return (len > 0 && (size_t)len < out_size) ? 0 : -EINVAL;
+}
+
+static int rmw_build_node_keyexpr(char *out, size_t out_size, struct context *ctx)
+{
+	const char *node_ns = CONFIG_SYNAPSE_ZENOH_PX4_RMW_NODE_NS;
+	const char *node_name = CONFIG_SYNAPSE_ZENOH_PX4_RMW_NODE_NAME;
+	const char *enclave = CONFIG_SYNAPSE_ZENOH_PX4_RMW_ENCLAVE;
+	char node_ns_mangled[64];
+	int len;
+
+	rmw_mangle_name(node_ns_mangled, sizeof(node_ns_mangled), node_ns);
+
+	len = snprintf(out, out_size, "@ros2_lv/%d/%s/0/0/NN/%s/%s/%s",
+		       CONFIG_SYNAPSE_ZENOH_PX4_DOMAIN_ID, ctx->zid_hex, enclave,
+		       node_ns_mangled, node_name);
+
+	return (len > 0 && (size_t)len < out_size) ? 0 : -EINVAL;
+}
+
+static int rmw_build_attachment(struct context *ctx, struct tx_row *row, z_owned_bytes_t *out)
+{
+	ze_owned_serializer_t ser;
+	uint64_t sample_us;
+
+	memcpy(&sample_us, row->pbuf, sizeof(sample_us));
+	int64_t ts_ns = (sample_us != 0)
+				? (int64_t)(sample_us * 1000ULL)
+				: (int64_t)k_ticks_to_ns_floor64(k_uptime_ticks());
+
+	if (ze_serializer_empty(&ser) < 0) {
+		return -EINVAL;
+	}
+
+	if (ze_serializer_serialize_int64(z_loan_mut(ser), row->seq++) < 0 ||
+	    ze_serializer_serialize_int64(z_loan_mut(ser), ts_ns) < 0 ||
+	    ze_serializer_serialize_buf(z_loan_mut(ser), ctx->source_gid,
+					sizeof(ctx->source_gid)) < 0) {
+		z_drop(z_move(ser));
+		return -EINVAL;
+	}
+	ze_serializer_finish(z_move(ser), out);
+	return 0;
+}
+#endif /* CONFIG_SYNAPSE_ZENOH_PX4_RMW_COMPAT */
+
+/* -------- session -------- */
+
+static int session_open(struct context *ctx)
+{
+#if IS_ENABLED(CONFIG_SYNAPSE_ZENOH_PX4_RUNTIME_CONFIG)
+
+	const bool is_peer = (g_run_cfg.mode == ZPX4_MODE_PEER);
+	const char *mode = is_peer ? "peer" : "client";
+	const uint8_t endpoint_key = is_peer ? Z_CONFIG_LISTEN_KEY : Z_CONFIG_CONNECT_KEY;
+	const char *endpoint_desc = is_peer ? "listen" : "connect";
+	const char *locator = g_run_cfg.locator;
+#elif defined(CONFIG_SYNAPSE_ZENOH_PX4_MODE_PEER)
+	const char *mode = "peer";
+	const uint8_t endpoint_key = Z_CONFIG_LISTEN_KEY;
+	const char *endpoint_desc = "listen";
+	const char *locator = CONFIG_SYNAPSE_ZENOH_PX4_LOCATOR;
+#else
+	const char *mode = "client";
+	const uint8_t endpoint_key = Z_CONFIG_CONNECT_KEY;
+	const char *endpoint_desc = "connect";
+	const char *locator = CONFIG_SYNAPSE_ZENOH_PX4_LOCATOR;
+#endif
+	z_owned_config_t config;
+	int ret;
+
+	LOG_INF("Opening PX4 zenoh session (%s, %s %s) ...", mode, endpoint_desc, locator);
+
+	while (true) {
+		z_config_default(&config);
+		zp_config_insert(z_loan_mut(config), Z_CONFIG_MODE_KEY, mode);
+		zp_config_insert(z_loan_mut(config), endpoint_key, locator);
+
+		ret = z_open(&ctx->sessions[0], z_move(config), NULL);
+		if (ret == 0) {
+			break;
+		}
+		LOG_WRN("z_open failed (%d), retrying...", ret);
+		if (k_sem_count_get(&ctx->running) != 0) {
+			(void)k_sem_take(&ctx->running, K_NO_WAIT);
+			LOG_INF("session open aborted by stop request");
+			return -ECANCELED;
+		}
+		k_sleep(K_SECONDS(5));
+
+	}
+
+
+#if Z_FEATURE_MULTI_THREAD == 1
+	if (zp_start_read_task(z_loan_mut(ctx->sessions[0]), NULL) < 0 ||
+	    zp_start_lease_task(z_loan_mut(ctx->sessions[0]), NULL) < 0) {
+		LOG_ERR("start read/lease tasks failed");
+		z_drop(z_move(ctx->sessions[0]));
+		return -EINVAL;
+	}
+#endif
+
+	LOG_INF("PX4 zenoh session open");
+	return 0;
+}
+
+#if BRIDGE_TX_COUNT > 0
+static int declare_publishers(struct context *ctx)
+{
+#if IS_ENABLED(CONFIG_SYNAPSE_ZENOH_PX4_RMW_COMPAT)
+	ctx->rmw_declared = rmw_compat_active();
+	if (ctx->rmw_declared) {
+		rmw_capture_source_gid(ctx);
+
+		char nke_str[RMW_LIVELINESS_KEYEXPR_MAX];
+		z_view_keyexpr_t nke;
+
+		if (rmw_build_node_keyexpr(nke_str, sizeof(nke_str), ctx) < 0) {
+			LOG_ERR("node keyexpr too long");
+			return -EINVAL;
+		}
+		if (z_view_keyexpr_from_str(&nke, nke_str) < 0) {
+			LOG_ERR("bad node keyexpr %s", nke_str);
+			return -EINVAL;
+		}
+		if (z_liveliness_declare_token(z_loan(ctx->sessions[0]), &ctx->node_token,
+					       z_loan(nke), NULL) < 0) {
+			LOG_ERR("node liveliness token declare failed");
+			return -EINVAL;
+		}
+		LOG_INF("PX4 zenoh node liveliness %s", nke_str);
+	}
+#endif
+
+	for (size_t i = 0; i < ARRAY_SIZE(tx_table); i++) {
+		char keyexpr[KEYEXPR_MAX];
+		z_view_keyexpr_t ke;
+		z_owned_encoding_t enc;
+		z_publisher_options_t opts;
+		int ret;
+
+		ret = build_keyexpr(keyexpr, sizeof(keyexpr), tx_table[i].topic_leaf,
+				    tx_table[i].ros_type, tx_table[i].rihs_hash);
+		if (ret < 0) {
+			LOG_ERR("keyexpr too long: %s", tx_table[i].topic_leaf);
+			return ret;
+		}
+
+		if (z_view_keyexpr_from_str(&ke, keyexpr) < 0) {
+			LOG_ERR("bad keyexpr %s", keyexpr);
+			return -EINVAL;
+		}
+		z_publisher_options_default(&opts);
+		if (z_encoding_from_str(&enc, CDR_ENCODING_STR) == 0) {
+			opts.encoding = z_move(enc);
+		}
+		if (z_declare_publisher(z_loan(ctx->sessions[0]), &tx_table[i].publisher,
+					z_loan(ke), &opts) < 0) {
+			LOG_ERR("declare_publisher failed for %s", keyexpr);
+			return -EINVAL;
+		}
+		LOG_INF("PX4 zenoh publisher %s", keyexpr);
+
+#if IS_ENABLED(CONFIG_SYNAPSE_ZENOH_PX4_RMW_COMPAT)
+		if (ctx->rmw_declared) {
+			char lke_str[RMW_LIVELINESS_KEYEXPR_MAX];
+			z_view_keyexpr_t lke;
+
+			tx_table[i].eid = (uint32_t)(i + 1);
+			tx_table[i].seq = 0;
+
+			if (rmw_build_liveliness_keyexpr(lke_str, sizeof(lke_str), ctx,
+							 &tx_table[i]) < 0) {
+				LOG_ERR("liveliness keyexpr too long: %s",
+					tx_table[i].topic_leaf);
+				return -EINVAL;
+			}
+			if (z_view_keyexpr_from_str(&lke, lke_str) < 0) {
+				LOG_ERR("bad liveliness keyexpr %s", lke_str);
+				return -EINVAL;
+			}
+			if (z_liveliness_declare_token(z_loan(ctx->sessions[0]),
+						       &tx_table[i].token, z_loan(lke),
+						       NULL) < 0) {
+				LOG_ERR("liveliness token declare failed for %s",
+					tx_table[i].topic_leaf);
+				return -EINVAL;
+			}
+			LOG_INF("PX4 zenoh liveliness %s", lke_str);
+		}
+#endif
+	}
+	return 0;
+}
+
+static void publish_cdr(struct tx_row *row)
+{
+	struct ucdrBuffer ub;
+	z_owned_bytes_t payload;
+	z_publisher_put_options_t opts;
+
+	ucdr_init_buffer(&ub, row->cdr_buf, row->cdr_size);
+	if (row->encode_fn(&ub, row->pbuf) != 0) {
+		LOG_WRN("CDR encode failed for %s", row->topic_leaf);
+		return;
+	}
+
+	const size_t len = (size_t)(ub.iterator - ub.init);
+
+	if (z_bytes_copy_from_buf(&payload, row->cdr_buf, len) < 0) {
+		return;
+	}
+	z_publisher_put_options_default(&opts);
+#if IS_ENABLED(CONFIG_SYNAPSE_ZENOH_PX4_RMW_COMPAT)
+	if (g_ctx.rmw_declared) {
+		z_owned_bytes_t attachment;
+		if (rmw_build_attachment(&g_ctx, row, &attachment) == 0) {
+			opts.attachment = z_move(attachment);
+		}
+	}
+#endif
+	if (z_publisher_put(z_loan(row->publisher), z_move(payload), &opts) < 0) {
+		LOG_WRN("publisher_put failed for %s", row->topic_leaf);
+	}
+}
+
+#endif /* BRIDGE_TX_COUNT > 0 */
+
+/* -------- bridge lifecycle -------- */
+
+static int bridge_init(struct context *ctx)
+{
+	k_sem_take(&ctx->running, K_FOREVER);
+	zros_node_init(&ctx->node, "zenoh_px4");
+
+#if BRIDGE_TX_COUNT > 0
+	for (size_t i = 0; i < ARRAY_SIZE(tx_table); i++) {
+		int ret = zros_sub_init(&tx_subs[i], &ctx->node, tx_table[i].ztopic,
+					tx_table[i].zbuf, tx_table[i].rate_hz);
+		if (ret < 0) {
+			LOG_ERR("zros_sub_init %zu failed: %d", i, ret);
+			return ret;
+		}
+	}
+#endif
+
+	int ret = session_open(ctx);
+	if (ret < 0) {
+		return ret;
+	}
+
+#if BRIDGE_TX_COUNT > 0
+	ret = declare_publishers(ctx);
+	if (ret < 0) {
+		return ret;
+	}
+#endif
+
+	LOG_INF("init");
+	return 0;
+}
+
+
+static void bridge_fini(struct context *ctx)
+{
+#if BRIDGE_TX_COUNT > 0
+#if IS_ENABLED(CONFIG_SYNAPSE_ZENOH_PX4_RMW_COMPAT)
+	if (ctx->rmw_declared) {
+		for (size_t i = 0; i < ARRAY_SIZE(tx_table); i++) {
+			z_liveliness_undeclare_token(z_move(tx_table[i].token));
+		}
+		z_liveliness_undeclare_token(z_move(ctx->node_token));
+	}
+#endif
+
+	for (size_t i = 0; i < ARRAY_SIZE(tx_table); i++) {
+		z_undeclare_publisher(z_move(tx_table[i].publisher));
+	}
+	for (size_t i = 0; i < ARRAY_SIZE(tx_table); i++) {
+		zros_sub_fini(&tx_subs[i]);
+	}
+#endif
+	z_drop(z_move(ctx->sessions[0]));
+	zros_node_fini(&ctx->node);
+	k_sem_give(&ctx->running);
+	LOG_INF("fini");
+}
+
+static void bridge_run(void *p0, void *p1, void *p2)
+{
+	struct context *ctx = p0;
+	ARG_UNUSED(p1);
+	ARG_UNUSED(p2);
+
+	if (bridge_init(ctx) < 0) {
+		bridge_fini(ctx);
+		return;
+	}
+
+#if BRIDGE_TX_COUNT > 0
+	struct k_poll_event events[ARRAY_SIZE(tx_table)];
+
+	for (size_t i = 0; i < ARRAY_SIZE(tx_table); i++) {
+		events[i] = *zros_sub_get_event(&tx_subs[i]);
+	}
+#endif
+
+	while (k_sem_take(&ctx->running, K_NO_WAIT) < 0) {
+
+#if BRIDGE_TX_COUNT > 0
+		for (size_t i = 0; i < ARRAY_SIZE(tx_table); i++) {
+			events[i].state = K_POLL_STATE_NOT_READY;
+		}
+		(void)k_poll(events, ARRAY_SIZE(events), K_MSEC(POLL_MS));
+
+		for (size_t i = 0; i < ARRAY_SIZE(tx_table); i++) {
+			if (zros_sub_update(&tx_subs[i]) == 0) {
+				tx_table[i].map_fn(tx_table[i].zbuf, tx_table[i].pbuf);
+				if (tx_table[i].valid_fn != NULL &&
+				    !tx_table[i].valid_fn(tx_table[i].pbuf)) {
+					continue;
+				}
+				publish_cdr(&tx_table[i]);
+			}
+
+		}
+#else
+		k_sleep(K_MSEC(POLL_MS));
+#endif
+	}
+
+
+	bridge_fini(ctx);
+}
+
+static int start(struct context *ctx)
+{
+	k_tid_t tid = k_thread_create(&ctx->thread_data, g_stack, K_THREAD_STACK_SIZEOF(g_stack),
+				      bridge_run, ctx, NULL, NULL, MY_PRIORITY, 0, K_FOREVER);
+	k_thread_name_set(tid, "zenoh_px4");
+	k_thread_start(tid);
+	return 0;
+}
+
+static int bridge_stop_sync(struct context *ctx)
+{
+	if (k_sem_count_get(&ctx->running) != 0) {
+		return -EALREADY;
+	}
+
+	k_sem_give(&ctx->running);
+	(void)k_thread_join(&ctx->thread_data, K_SECONDS(10));
+	return 0;
+}
+
+#if IS_ENABLED(CONFIG_SYNAPSE_ZENOH_PX4_RUNTIME_CONFIG)
+
+static int zpx4_config_net(const struct shell *sh, uint8_t mode, const char *ipport)
+{
+	int n = snprintf(g_run_cfg.locator, sizeof(g_run_cfg.locator), "tcp/%s", ipport);
+
+	if (n < 0 || (size_t)n >= sizeof(g_run_cfg.locator)) {
+		shell_error(sh, "locator too long");
+		return -EINVAL;
+	}
+	g_run_cfg.mode = mode;
+
+	shell_print(sh, "staged %s %s (run `zenoh_px4 restart` to apply)",
+		    mode == ZPX4_MODE_PEER ? "peer" : "client", g_run_cfg.locator);
+	return 0;
+}
+
+static int cmd_config_net_peer(const struct shell *sh, size_t argc, char **argv)
+{
+	ARG_UNUSED(argc);
+	return zpx4_config_net(sh, ZPX4_MODE_PEER, argv[1]);
+}
+
+static int cmd_config_net_client(const struct shell *sh, size_t argc, char **argv)
+{
+	ARG_UNUSED(argc);
+	return zpx4_config_net(sh, ZPX4_MODE_CLIENT, argv[1]);
+}
+
+static int cmd_config_show(const struct shell *sh, size_t argc, char **argv)
+{
+	ARG_UNUSED(argc);
+	ARG_UNUSED(argv);
+	shell_print(sh, "mode:    %s", g_run_cfg.mode == ZPX4_MODE_PEER ? "peer" : "client");
+	shell_print(sh, "locator: %s", g_run_cfg.locator);
+	shell_print(sh, "running: %d", (int)(k_sem_count_get(&g_ctx.running) == 0));
+	return 0;
+}
+
+static int cmd_restart(const struct shell *sh, size_t argc, char **argv)
+{
+	ARG_UNUSED(argc);
+	ARG_UNUSED(argv);
+	(void)bridge_stop_sync(&g_ctx);
+	start(&g_ctx);
+	shell_print(sh, "restarted (%s %s)",
+		    g_run_cfg.mode == ZPX4_MODE_PEER ? "peer" : "client", g_run_cfg.locator);
+	return 0;
+}
+
+SHELL_STATIC_SUBCMD_SET_CREATE(sub_config_net,
+	SHELL_CMD_ARG(peer, NULL, "peer <ip>:<port> (node LISTENs on this local addr)",
+		      cmd_config_net_peer, 2, 0),
+	SHELL_CMD_ARG(client, NULL, "client <ip>:<port> (connect to zenoh router)",
+		      cmd_config_net_client, 2, 0),
+	SHELL_SUBCMD_SET_END);
+
+SHELL_STATIC_SUBCMD_SET_CREATE(sub_config,
+	SHELL_CMD(net, &sub_config_net, "set net mode + locator", NULL),
+	SHELL_CMD(show, NULL, "show staged/active config", cmd_config_show),
+	SHELL_SUBCMD_SET_END);
+
+static int cmd_start(const struct shell *sh, size_t argc, char **argv)
+{
+	ARG_UNUSED(argc);
+	ARG_UNUSED(argv);
+	if (k_sem_count_get(&g_ctx.running) == 0) {
+		shell_print(sh, "already running");
+	} else {
+		start(&g_ctx);
+	}
+	return 0;
+}
+
+static int cmd_stop(const struct shell *sh, size_t argc, char **argv)
+{
+	ARG_UNUSED(argc);
+	ARG_UNUSED(argv);
+	if (bridge_stop_sync(&g_ctx) < 0) {
+		shell_print(sh, "not running");
+	}
+	return 0;
+}
+
+static int cmd_status(const struct shell *sh, size_t argc, char **argv)
+{
+	ARG_UNUSED(argc);
+	ARG_UNUSED(argv);
+	shell_print(sh, "running: %d", (int)(k_sem_count_get(&g_ctx.running) == 0));
+	return 0;
+}
+
+SHELL_STATIC_SUBCMD_SET_CREATE(sub_zenoh_px4,
+	SHELL_CMD(start, NULL, "start bridge", cmd_start),
+	SHELL_CMD(stop, NULL, "stop bridge", cmd_stop),
+	SHELL_CMD(status, NULL, "bridge status", cmd_status),
+	SHELL_CMD(config, &sub_config, "runtime net config", NULL),
+	SHELL_CMD(restart, NULL, "reopen session with current config", cmd_restart),
+	SHELL_SUBCMD_SET_END);
+
+#else /* !CONFIG_SYNAPSE_ZENOH_PX4_RUNTIME_CONFIG */
+
+static int zenoh_cmd_handler(const struct shell *sh, size_t argc, char **argv, void *data)
+{
+	ARG_UNUSED(argc);
+	struct context *ctx = data;
+
+	if (strcmp(argv[0], "start") == 0) {
+		if (k_sem_count_get(&ctx->running) == 0) {
+			shell_print(sh, "already running");
+		} else {
+			start(ctx);
+		}
+	} else if (strcmp(argv[0], "stop") == 0) {
+		if (bridge_stop_sync(ctx) < 0) {
+			shell_print(sh, "not running");
+		}
+	} else if (strcmp(argv[0], "status") == 0) {
+		shell_print(sh, "running: %d", (int)(k_sem_count_get(&ctx->running) == 0));
+	}
+	return 0;
+}
+
+SHELL_SUBCMD_DICT_SET_CREATE(sub_zenoh_px4, zenoh_cmd_handler, (start, &g_ctx, "start"),
+			     (stop, &g_ctx, "stop"), (status, &g_ctx, "status"));
+
+
+#endif /* CONFIG_SYNAPSE_ZENOH_PX4_RUNTIME_CONFIG */
+
+SHELL_CMD_REGISTER(zenoh_px4, &sub_zenoh_px4, "PX4 zenoh CDR egress", NULL);
+
+static int zenoh_px4_sys_init(void)
+{
+	return start(&g_ctx);
+}
+
+SYS_INIT(zenoh_px4_sys_init, APPLICATION, 92);
+
+/* vi: ts=4 sw=4 et */

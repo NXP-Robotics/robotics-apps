@@ -1,0 +1,87 @@
+/*
+ * Copyright 2026 NXP
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * The F9P GNSS is wired to FlexComm2/LPUART2 on this variant, for which no
+ * upstream shield exists, so the node and its pinctrl are defined locally.
+ */
+#include <zephyr/dt-bindings/input/input-event-codes.h>
+#include <zephyr/dt-bindings/sensor/icm45686.h>
+
+/ {
+	aliases {
+		imu-stream-0 = &icm45686_0;
+		gnss = &gnss1;
+	};
+};
+
+/* USB shell IRQ priority lower than the sensor IRQs */
+&zephyr_udc0 {
+	interrupts = <0x43 0x6>;
+};
+
+&icm45686_0 {
+	accel-odr = <ICM45686_DT_ACCEL_ODR_3200>;
+	gyro-odr = <ICM45686_DT_GYRO_ODR_3200>;
+	fifo-watermark = <4>;
+	fifo-watermark-equals;
+};
+
+&flexcomm2_lpspi2 {
+	status = "disabled";
+};
+
+&flexcomm2 {
+	status = "okay";
+};
+
+&flexcomm2_lpuart2 {
+	status = "okay";
+	pinctrl-0 = <&pinmux_flexcomm2_lpuart>;
+	pinctrl-names = "default";
+	current-speed = <38400>;
+
+	gnss1: gnss {
+		status = "okay";
+		compatible = "u-blox,f9p";
+		fix-rate = <100>;
+		initial-baudrate = <38400>;
+	};
+};
+
+&pinctrl {
+	pinmux_flexcomm2_lpuart: pinmux_flexcomm2_lpuart {
+		group0 {
+			pinmux = <FC2_P0_PIO4_0>,
+				 <FC2_P1_PIO4_1>;
+			slew-rate = "fast";
+			drive-strength = "low";
+			input-enable;
+		};
+	};
+};
+
+/ {
+	gpio_keys {
+		compatible = "gpio-keys";
+		button_sw1: button_sw1 {
+			gpios = <&gpio1 2 GPIO_ACTIVE_LOW>;
+			label = "SW1";
+			zephyr,code = <INPUT_KEY_0>;
+		};
+		button_sw2: button_sw2 {
+			gpios = <&gpio1 3 GPIO_ACTIVE_LOW>;
+			label = "SW2";
+			zephyr,code = <INPUT_KEY_1>;
+		};
+	};
+
+	gnss_leds {
+		compatible = "gpio-leds";
+		led_gpsfix: led_gpsfix {
+			gpios = <&gpio3 9 GPIO_ACTIVE_HIGH>;
+			label = "GPSFIX";
+		};
+	};
+};
