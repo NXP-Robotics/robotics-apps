@@ -2,8 +2,8 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-if(DEFINED ENV{WEST_TOPDIR})
-  set(MICROCDR_DIR "$ENV{WEST_TOPDIR}/modules/lib/microcdr")
+if(DEFINED WEST_TOPDIR)
+  set(MICROCDR_DIR "${WEST_TOPDIR}/modules/lib/microcdr")
 else()
   set(MICROCDR_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../../../modules/lib/microcdr")
 endif()
