@@ -52,6 +52,27 @@ LOG_MODULE_REGISTER(synapse_zenoh_px4, CONFIG_SYNAPSE_ZENOH_PX4_LOG_LEVEL);
 #define DIST_MIN_M 0.08f
 #define DIST_MAX_M 30.0f
 
+/* Consecutive publisher_put failures tolerated before the session is
+ * considered dead and an automatic reconnect is attempted. This matters in
+ * client mode: if the TCP link to the router drops, zenoh-pico tears down the
+ * transport and every subsequent put fails until the session is reopened.
+ */
+#define PUT_FAIL_LIMIT 10
+
+/* Optical-flow producer metadata (PAA3905 / AFBR-S50). These are sensor
+ * datasheet constants used by EKF2 for gating; confirm against the parts fitted.
+ */
+#define FLOW_MAX_RATE_RAD_S 7.4f       /* PAA3905-class angular-rate saturation */
+#define FLOW_MIN_GND_DIST_M DIST_MIN_M /* AFBR-S50 min valid range */
+#define FLOW_MAX_GND_DIST_M DIST_MAX_M /* AFBR-S50 max valid range */
+/* Per-count angular resolution of the PAA3905 flow output, in radians.
+ * pixel_flow (rad) = raw_delta_counts * FLOW_RAD_PER_COUNT. CALIBRATE this
+ * against a known-motion test for your optics; the value below is a starting
+ * point derived from CONFIG (micro-rad per count). */
+#define FLOW_RAD_PER_COUNT (CONFIG_SYNAPSE_ZENOH_PX4_FLOW_URAD_PER_COUNT * 1.0e-6f)
+/* Clamp for the stamp-derived integration window (guards huge/negative dt). */
+#define FLOW_DT_MAX_US 100000ULL /* 100 ms */
+
 /* CDR/ROS2 media type used on every publisher-put. */
 #define CDR_ENCODING_STR "application/octet-stream;encoding=cdr"
 
@@ -189,34 +210,84 @@ static uint8_t px4_flow_mode_from_pb(uint32_t pb_mode)
 	}
 }
 
+/* Latest ground range (m), cached from the argus/distance path so it can be
+ * embedded in each optical-flow sample. Written by map_distance_sensor(),
+ * read by map_optical_flow(). Single writer/reader on the same bridge thread,
+ * so no lock is needed. Defined once (outside the per-topic blocks) so it is
+ * available whenever the distance path is compiled in. */
+#if BRIDGE_TX_DISTANCE_SENSOR
+static float s_last_range_m;
+static bool  s_last_range_valid;
+#endif
+
+/* Previous flow stamp (us), used to derive the integration window because the
+ * raw PixartPAA3905 proto carries no per-sample dt. */
+static uint64_t s_flow_last_us;
+
 static void map_optical_flow(const synapse_pb_PixartPAA3905 *z,
 			     px4_msgs_c_SensorOpticalFlow_t *p)
 {
 	memset(p, 0, sizeof(*p));
 
+	uint64_t now_us = 0;
 	if (z->has_stamp) {
-		p->timestamp        = stamp_to_us(&z->stamp);
-		p->timestamp_sample = p->timestamp;
+		now_us = stamp_to_us(&z->stamp);
+		p->timestamp        = now_us;
+		p->timestamp_sample = now_us;
 	}
 	p->device_id = 0;
 
-	p->pixel_flow[0] = (float)z->delta_x;
-	p->pixel_flow[1] = -(float)z->delta_y;
+	/* Integration window from the stamp delta (clamped). The very first
+	 * sample yields dt=0 and is rejected by flow_sample_valid(). */
+	uint32_t dt_us = 0;
+	if (s_flow_last_us != 0ULL && now_us > s_flow_last_us) {
+		uint64_t d = now_us - s_flow_last_us;
+		if (d > FLOW_DT_MAX_US) {
+			d = FLOW_DT_MAX_US;
+		}
+		dt_us = (uint32_t)d;
+	}
+	s_flow_last_us = now_us;
+	p->integration_timespan_us = dt_us;
 
+	/* Raw PAA3905 counts -> integrated angular displacement (rad).
+	 * Sign on Y matches the previous FLU/sensor axis convention. */
+	p->pixel_flow[0] =  (float)z->delta_x * FLOW_RAD_PER_COUNT;
+	p->pixel_flow[1] = -(float)z->delta_y * FLOW_RAD_PER_COUNT;
+
+	/* Gyro de-rotation: not supplied by the flow sensor itself. Left
+	 * unavailable so EKF2 de-rotates with the FMU/vehicle gyro. To supply
+	 * it here, integrate topic_imu0 over [s_flow_last_us, now_us] and set
+	 * delta_angle[]/delta_angle_available = true. */
 	p->delta_angle[0]        = 0.0f;
 	p->delta_angle[1]        = 0.0f;
 	p->delta_angle[2]        = 0.0f;
 	p->delta_angle_available = false;
 
-	p->distance_m              = 0.0f;
-	p->distance_available      = false;
-	p->integration_timespan_us = 0;
-	p->quality                 = (uint8_t)MIN(z->squal, 255U);
-	p->error_count             = 0;
-	p->max_flow_rate           = 0.0f;
-	p->min_ground_distance     = 0.0f;
-	p->max_ground_distance     = 0.0f;
-	p->mode                    = px4_flow_mode_from_pb(z->mode);
+	/* Height above ground: reuse the latest AFBR-S50 range so EKF2 gets a
+	 * time-aligned distance embedded in the flow sample. */
+#if BRIDGE_TX_DISTANCE_SENSOR
+	p->distance_m         = s_last_range_valid ? s_last_range_m : 0.0f;
+	p->distance_available = s_last_range_valid;
+#else
+	p->distance_m         = 0.0f;
+	p->distance_available = false;
+#endif
+
+	p->quality             = (uint8_t)MIN(z->squal, 255U);
+	p->error_count         = 0;
+	p->max_flow_rate       = FLOW_MAX_RATE_RAD_S;
+	p->min_ground_distance = FLOW_MIN_GND_DIST_M;
+	p->max_ground_distance = FLOW_MAX_GND_DIST_M;
+	p->mode                = px4_flow_mode_from_pb(z->mode);
+}
+
+/* Drop samples EKF2 cannot use: a zero integration window (first sample or a
+ * stalled producer) makes flow_rate = flow/dt undefined, and zero quality is
+ * unusable. Mirrors the gps_sample_valid() gating pattern. */
+static bool flow_sample_valid(const px4_msgs_c_SensorOpticalFlow_t *p)
+{
+	return p->integration_timespan_us > 0U && p->quality > 0U;
 }
 #endif /* BRIDGE_TX_OPTICAL_FLOW */
 
@@ -235,6 +306,14 @@ static void map_distance_sensor(const synapse_pb_ArgusResults *z,
 	p->current_distance = z->has_bin ? z->bin.range : 0.0f;
 	p->variance         = 0.0f;
 	p->signal_quality   = z->has_bin ? (int8_t)MIN(z->bin.signal_quality, 100U) : (int8_t)-1;
+
+	/* Cache range so map_optical_flow() can embed a fresh height in each
+	 * SensorOpticalFlow sample. Valid only for an in-range reading. */
+#if BRIDGE_TX_OPTICAL_FLOW
+	s_last_range_valid = z->has_bin && p->current_distance >= DIST_MIN_M &&
+			     p->current_distance <= DIST_MAX_M;
+	s_last_range_m = s_last_range_valid ? p->current_distance : 0.0f;
+#endif
 	p->type             = PX4_MSGS_C_DISTANCE_SENSOR_TYPE_LASER;
 	p->h_fov            = 0.0f;
 	p->v_fov            = 0.0f;
@@ -364,6 +443,10 @@ static int enc_flow_thunk(struct ucdrBuffer *ub, const void *p)
 	return px4_msgs_c_encode_sensor_optical_flow(ub,
 			(const px4_msgs_c_SensorOpticalFlow_t *)p);
 }
+static bool valid_flow_thunk(const void *p)
+{
+	return flow_sample_valid((const px4_msgs_c_SensorOpticalFlow_t *)p);
+}
 #endif
 #if BRIDGE_TX_DISTANCE_SENSOR
 static void map_dist_thunk(const void *z, void *p)
@@ -415,6 +498,7 @@ static struct tx_row tx_table[] = {
 		.cdr_size   = sizeof(g_ctx.cdr_flow),
 		.map_fn     = map_flow_thunk,
 		.encode_fn  = enc_flow_thunk,
+		.valid_fn   = valid_flow_thunk,
 		.topic_leaf = PX4_MSGS_C_TOPIC_SENSOR_OPTICAL_FLOW,
 		.ros_type   = PX4_MSGS_C_ROS_TYPE_SENSOR_OPTICAL_FLOW,
 		.rihs_hash  = PX4_MSGS_C_RIHS_SENSOR_OPTICAL_FLOW,
@@ -783,7 +867,7 @@ static int declare_publishers(struct context *ctx)
 	return 0;
 }
 
-static void publish_cdr(struct tx_row *row)
+static int publish_cdr(struct tx_row *row)
 {
 	struct ucdrBuffer ub;
 	z_owned_bytes_t payload;
@@ -792,13 +876,13 @@ static void publish_cdr(struct tx_row *row)
 	ucdr_init_buffer(&ub, row->cdr_buf, row->cdr_size);
 	if (row->encode_fn(&ub, row->pbuf) != 0) {
 		LOG_WRN("CDR encode failed for %s", row->topic_leaf);
-		return;
+		return -EMSGSIZE;
 	}
 
 	const size_t len = (size_t)(ub.iterator - ub.init);
 
 	if (z_bytes_copy_from_buf(&payload, row->cdr_buf, len) < 0) {
-		return;
+		return -ENOMEM;
 	}
 	z_publisher_put_options_default(&opts);
 #if IS_ENABLED(CONFIG_SYNAPSE_ZENOH_PX4_RMW_COMPAT)
@@ -810,8 +894,9 @@ static void publish_cdr(struct tx_row *row)
 	}
 #endif
 	if (z_publisher_put(z_loan(row->publisher), z_move(payload), &opts) < 0) {
-		LOG_WRN("publisher_put failed for %s", row->topic_leaf);
+		return -EIO;
 	}
+	return 0;
 }
 
 #endif /* BRIDGE_TX_COUNT > 0 */
@@ -876,6 +961,47 @@ static void bridge_fini(struct context *ctx)
 	LOG_INF("fini");
 }
 
+#if BRIDGE_TX_COUNT > 0
+/* Tear down the publishers, liveliness tokens and session so a fresh
+ * session_open()/declare_publishers() can rebuild them. Mirrors bridge_fini()
+ * but keeps the zros subscriptions alive across the reconnect. */
+static void session_teardown(struct context *ctx)
+{
+#if IS_ENABLED(CONFIG_SYNAPSE_ZENOH_PX4_RMW_COMPAT)
+	if (ctx->rmw_declared) {
+		for (size_t i = 0; i < ARRAY_SIZE(tx_table); i++) {
+			z_liveliness_undeclare_token(z_move(tx_table[i].token));
+		}
+		z_liveliness_undeclare_token(z_move(ctx->node_token));
+		ctx->rmw_declared = false;
+	}
+#endif
+	for (size_t i = 0; i < ARRAY_SIZE(tx_table); i++) {
+		z_undeclare_publisher(z_move(tx_table[i].publisher));
+	}
+	z_drop(z_move(ctx->sessions[0]));
+}
+
+static int bridge_reconnect(struct context *ctx)
+{
+	int ret;
+
+	LOG_WRN("session lost, reconnecting...");
+	session_teardown(ctx);
+
+	ret = session_open(ctx);
+	if (ret < 0) {
+		return ret;
+	}
+	ret = declare_publishers(ctx);
+	if (ret < 0) {
+		return ret;
+	}
+	LOG_INF("reconnected");
+	return 0;
+}
+#endif /* BRIDGE_TX_COUNT > 0 */
+
 static void bridge_run(void *p0, void *p1, void *p2)
 {
 	struct context *ctx = p0;
@@ -889,6 +1015,7 @@ static void bridge_run(void *p0, void *p1, void *p2)
 
 #if BRIDGE_TX_COUNT > 0
 	struct k_poll_event events[ARRAY_SIZE(tx_table)];
+	unsigned int put_fails = 0;
 
 	for (size_t i = 0; i < ARRAY_SIZE(tx_table); i++) {
 		events[i] = *zros_sub_get_event(&tx_subs[i]);
@@ -910,9 +1037,24 @@ static void bridge_run(void *p0, void *p1, void *p2)
 				    !tx_table[i].valid_fn(tx_table[i].pbuf)) {
 					continue;
 				}
-				publish_cdr(&tx_table[i]);
+				if (publish_cdr(&tx_table[i]) == -EIO) {
+					if (put_fails == 0) {
+						LOG_WRN("publisher_put failed for %s",
+							tx_table[i].topic_leaf);
+					}
+					put_fails++;
+				} else {
+					put_fails = 0;
+				}
 			}
 
+		}
+
+		if (put_fails >= PUT_FAIL_LIMIT) {
+			if (bridge_reconnect(ctx) < 0) {
+				break;
+			}
+			put_fails = 0;
 		}
 #else
 		k_sleep(K_MSEC(POLL_MS));

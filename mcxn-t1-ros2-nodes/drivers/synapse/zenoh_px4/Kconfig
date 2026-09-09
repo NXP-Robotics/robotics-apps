@@ -224,6 +224,21 @@ config SYNAPSE_ZENOH_PX4_OPTICAL_FLOW_RATE_HZ
 	int "Optical flow publish rate cap (Hz, 0 = off, -1 = unlimited)"
 	default -1
 
+config SYNAPSE_ZENOH_PX4_FLOW_URAD_PER_COUNT
+	int "Optical-flow angular resolution (micro-radians per raw count)"
+	default 2000
+	help
+	  Per-count angular resolution of the PAA3905 flow output, in
+	  MICRO-radians. The bridge converts the raw integer delta counts into
+	  the integrated angular displacement (radians) PX4 expects:
+
+	    pixel_flow[rad] = raw_delta_counts * (this_value * 1e-6)
+
+	  The default (2000 urad/count = 0.002 rad/count) is only a starting
+	  point. CALIBRATE it for your optics: command a known translation at a
+	  known height, then adjust until EKF2's reported velocity matches ground
+	  truth. A wrong value scales optical-flow velocity linearly.
+
 config SYNAPSE_ZENOH_PX4_DISTANCE_SENSOR_RATE_HZ
 	int "Distance sensor publish rate cap (Hz, 0 = off, -1 = unlimited)"
 	default -1

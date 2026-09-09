@@ -16,7 +16,7 @@ LOG_MODULE_REGISTER(optical_flow_boot_banner, CONFIG_SPINALI_OPTICAL_FLOW_LOG_LE
 
 static int optical_flow_boot_banner_sys_init(void)
 {
-	LOG_INF("Spinali Optical Flow %d.%d.%d", CONFIG_SPINALI_VERSION_MAJOR,
+	LOG_INF("MCXN-T1-ROS2-Node Optical Flow %d.%d.%d", CONFIG_SPINALI_VERSION_MAJOR,
 		CONFIG_SPINALI_VERSION_MINOR, CONFIG_SPINALI_VERSION_PATCH);
 #if defined(CONFIG_SPINALI_CORE_COMMON_BOOT_BANNER)
 	printf("%s", banner_spinali);
