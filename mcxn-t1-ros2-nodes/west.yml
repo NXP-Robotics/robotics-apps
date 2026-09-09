@@ -12,7 +12,7 @@ manifest:
     - name: cognipilot
       url-base: https://github.com/CogniPilot
     - name: nxp
-      url-base: ssh://git@bitbucket.sw.nxp.com/tars
+      url-base: https://github.com/nxp-mobilerobotics
   projects:
     - name: zephyr-rtos
       remote: nxp
