@@ -47,10 +47,10 @@ LOG_MODULE_REGISTER(synapse_zenoh_px4, CONFIG_SYNAPSE_ZENOH_PX4_LOG_LEVEL);
 
 
 #define MY_STACK_SIZE 8192
-#define MY_PRIORITY   5
+#define MY_PRIORITY   4
 #define KEYEXPR_MAX   200
 #define CDR_BUF_MAX   256U
-#define POLL_MS       50
+#define POLL_MS       10
 #define DIST_MIN_M 0.08f
 #define DIST_MAX_M 30.0f
 
@@ -947,13 +947,12 @@ static int declare_publishers(struct context *ctx)
 			return -EINVAL;
 		}
 		z_publisher_options_default(&opts);
-		/* High-rate sensor streams must fail SOFT under back-pressure: drop the
-		 * sample instead of blocking/erroring (which would otherwise trip the
-		 * reconnect logic and storm). BEST_EFFORT + DROP is the right policy for
-		 * telemetry; a lost IMU/flow sample is harmless, a reconnect storm is not.
-		 * (PX4's own zenoh module uses the same knobs per-topic.) */
-		opts.reliability = Z_RELIABILITY_BEST_EFFORT;
+
 		opts.congestion_control = Z_CONGESTION_CONTROL_DROP;
+#ifdef Z_FEATURE_UNSTABLE_API
+		opts.reliability = Z_RELIABILITY_BEST_EFFORT;
+#endif
+
 		if (z_encoding_from_str(&enc, CDR_ENCODING_STR) == 0) {
 			opts.encoding = z_move(enc);
 		}
@@ -1010,7 +1009,7 @@ static int publish_cdr(struct tx_row *row)
 
 	const size_t len = (size_t)(ub.iterator - ub.init);
 
-	if (z_bytes_copy_from_buf(&payload, row->cdr_buf, len) < 0) {
+	if (z_bytes_from_static_buf(&payload, row->cdr_buf, len) < 0) {
 		return -ENOMEM;
 	}
 	z_publisher_put_options_default(&opts);
@@ -1091,9 +1090,7 @@ static void bridge_fini(struct context *ctx)
 }
 
 #if BRIDGE_TX_COUNT > 0
-/* Tear down the publishers, liveliness tokens and session so a fresh
- * session_open()/declare_publishers() can rebuild them. Mirrors bridge_fini()
- * but keeps the zros subscriptions alive across the reconnect. */
+
 static void session_teardown(struct context *ctx)
 {
 #if IS_ENABLED(CONFIG_SYNAPSE_ZENOH_PX4_RMW_COMPAT)
@@ -1232,10 +1229,17 @@ static int bridge_stop_sync(struct context *ctx)
 
 #if IS_ENABLED(CONFIG_SYNAPSE_ZENOH_PX4_RUNTIME_CONFIG)
 
-static int zpx4_config_net(const struct shell *sh, uint8_t mode, const char *ipport)
+static int zpx4_config_net(const struct shell *sh, uint8_t mode, const char *arg)
 {
-	int n = snprintf(g_run_cfg.locator, sizeof(g_run_cfg.locator), "tcp/%s", ipport);
+	int n;
 
+	if (strncmp(arg, "tcp/", 4) != 0 && strncmp(arg, "udp/", 4) != 0) {
+		shell_error(sh,
+			    "locator must start with 'tcp/' or 'udp/' (e.g. tcp/10.58.0.1:7447)");
+		return -EINVAL;
+	}
+
+	n = snprintf(g_run_cfg.locator, sizeof(g_run_cfg.locator), "%s", arg);
 	if (n < 0 || (size_t)n >= sizeof(g_run_cfg.locator)) {
 		shell_error(sh, "locator too long");
 		return -EINVAL;
@@ -1281,10 +1285,10 @@ static int cmd_restart(const struct shell *sh, size_t argc, char **argv)
 }
 
 SHELL_STATIC_SUBCMD_SET_CREATE(sub_config_net,
-	SHELL_CMD_ARG(peer, NULL, "peer <ip>:<port> (node LISTENs on this local addr)",
-		      cmd_config_net_peer, 2, 0),
-	SHELL_CMD_ARG(client, NULL, "client <ip>:<port> (connect to zenoh router)",
-		      cmd_config_net_client, 2, 0),
+	SHELL_CMD_ARG(peer, NULL, "peer {tcp|udp}/<ip>:<port> (node LISTENs on this local addr)",
+            cmd_config_net_peer, 2, 0),
+	SHELL_CMD_ARG(client, NULL, "client {tcp|udp}/<ip>:<port> (connect to zenoh router)",
+            cmd_config_net_client, 2, 0),
 	SHELL_SUBCMD_SET_END);
 
 SHELL_STATIC_SUBCMD_SET_CREATE(sub_config,
