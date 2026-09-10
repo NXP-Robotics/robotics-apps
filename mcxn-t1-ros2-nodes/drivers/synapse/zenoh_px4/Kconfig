@@ -251,6 +251,23 @@ config SYNAPSE_ZENOH_PX4_MAG_RATE_HZ
 	int "Sensor mag publish rate cap (Hz, 0 = off, -1 = unlimited)"
 	default 50
 
+config SYNAPSE_ZENOH_PX4_SENSOR_COMBINED_RATE_HZ
+	int "Sensor combined (IMU) publish rate cap (Hz, 0 = off, -1 = unlimited)"
+	default 0
+	help
+	  Publishes the ICM IMU (ZROS topic_imu0) as px4_msgs SensorCombined
+	  (FRD, accel+gyro) on <domain>/fmu/in/sensor_combined/... . 0 disables
+	  the row (default). For RViz "movement" ~100 Hz is plenty; the on-node
+	  IMU runs far faster. gyro/accel integration periods are derived from
+	  the message-stamp delta.
+
+	  NOTE on EKF2: this is the topic single-instance EKF2 (SENS_IMU_MODE=1)
+	  reads. On a flight controller that already publishes sensor_combined
+	  from its own IMU driver, an injected copy competes with the local
+	  publisher and will NOT cleanly drive EKF2 (works only on a PX4 with no
+	  local IMU / replay-style). It is always fine for visualization. Multi-
+	  EKF (SENS_IMU_MODE=0) uses vehicle_imu instead and ignores this topic.
+
 module = SYNAPSE_ZENOH_PX4
 module-str = synapse_zenoh_px4
 source "subsys/logging/Kconfig.template.log_config"

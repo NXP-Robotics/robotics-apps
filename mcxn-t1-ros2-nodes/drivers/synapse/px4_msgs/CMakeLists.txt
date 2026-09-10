@@ -31,6 +31,7 @@ zephyr_library_sources(
   src/encode_distance_sensor.c
   src/encode_sensor_gps.c
   src/encode_sensor_mag.c
+  src/encode_sensor_combined.c
 )
 zephyr_library_include_directories(include)
 zephyr_include_directories(include)

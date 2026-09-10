@@ -31,11 +31,13 @@
 #include <synapse_topic_list.h>
 
 #include <synapse_pb/argus_results.pb.h>
+#include <synapse_pb/imu.pb.h>
 #include <synapse_pb/magnetic_field.pb.h>
 #include <synapse_pb/nav_sat_fix.pb.h>
 #include <synapse_pb/pixart_paa3905.pb.h>
 
 #include <px4_msgs_c/distance_sensor.h>
+#include <px4_msgs_c/sensor_combined.h>
 #include <px4_msgs_c/sensor_gps.h>
 #include <px4_msgs_c/sensor_mag.h>
 #include <px4_msgs_c/sensor_optical_flow.h>
@@ -100,9 +102,15 @@ LOG_MODULE_REGISTER(synapse_zenoh_px4, CONFIG_SYNAPSE_ZENOH_PX4_LOG_LEVEL);
 #define BRIDGE_TX_SENSOR_MAG 0
 #endif
 
+#if (CONFIG_SYNAPSE_ZENOH_PX4_SENSOR_COMBINED_RATE_HZ != 0)
+#define BRIDGE_TX_SENSOR_COMBINED 1
+#else
+#define BRIDGE_TX_SENSOR_COMBINED 0
+#endif
+
 #define BRIDGE_TX_COUNT                                                                            \
 	(BRIDGE_TX_OPTICAL_FLOW + BRIDGE_TX_DISTANCE_SENSOR + BRIDGE_TX_SENSOR_GPS +                \
-	 BRIDGE_TX_SENSOR_MAG)
+	 BRIDGE_TX_SENSOR_MAG + BRIDGE_TX_SENSOR_COMBINED)
 
 static K_THREAD_STACK_DEFINE(g_stack, MY_STACK_SIZE);
 
@@ -128,6 +136,11 @@ struct context {
 	synapse_pb_MagneticField        z_mag;
 	px4_msgs_c_SensorMag_t          p_mag;
 	uint8_t                         cdr_mag[CDR_BUF_MAX];
+#endif
+#if BRIDGE_TX_SENSOR_COMBINED
+	synapse_pb_Imu                  z_imu;
+	px4_msgs_c_SensorCombined_t     p_imu;
+	uint8_t                         cdr_imu[CDR_BUF_MAX];
 #endif
 
 	z_owned_session_t sessions[1];
@@ -408,6 +421,68 @@ static void map_sensor_mag(const synapse_pb_MagneticField *z, px4_msgs_c_SensorM
 }
 #endif
 
+#if BRIDGE_TX_SENSOR_COMBINED
+/* Previous IMU stamp (us) for deriving the integration period, since
+ * synapse_pb_Imu carries no per-sample dt. */
+static uint64_t s_imu_last_us;
+
+/* px4 SensorCombined integration periods are uint32 us; clamp the stamp delta. */
+#define IMU_DT_MAX_US 100000U /* 100 ms */
+
+static void map_sensor_combined(const synapse_pb_Imu *z, px4_msgs_c_SensorCombined_t *p)
+{
+	memset(p, 0, sizeof(*p));
+
+	uint64_t now_us = 0;
+	if (z->has_stamp) {
+		now_us = stamp_to_us(&z->stamp);
+		p->timestamp = now_us;
+	}
+
+	/* Integration period from the stamp delta (clamped). First sample -> 0,
+	 * rejected by sensor_combined_valid(). Gyro and accel are sampled together
+	 * on the ICM, so they share the same window. */
+	uint32_t dt_us = 0;
+	if (s_imu_last_us != 0ULL && now_us > s_imu_last_us) {
+		uint64_t d = now_us - s_imu_last_us;
+		if (d > IMU_DT_MAX_US) {
+			d = IMU_DT_MAX_US;
+		}
+		dt_us = (uint32_t)d;
+	}
+	s_imu_last_us = now_us;
+
+	/* FLU (x fwd, y left, z up) -> FRD (x fwd, y right, z down): negate y,z.
+	 * Same axis convention as map_sensor_mag(). */
+	if (z->has_angular_velocity) {
+		p->gyro_rad[0] =  (float)z->angular_velocity.x;
+		p->gyro_rad[1] = -(float)z->angular_velocity.y;
+		p->gyro_rad[2] = -(float)z->angular_velocity.z;
+	}
+	p->gyro_integral_dt = dt_us;
+
+	p->accelerometer_timestamp_relative = 0; /* accel stamped same as gyro */
+	if (z->has_linear_acceleration) {
+		p->accelerometer_m_s2[0] =  (float)z->linear_acceleration.x;
+		p->accelerometer_m_s2[1] = -(float)z->linear_acceleration.y;
+		p->accelerometer_m_s2[2] = -(float)z->linear_acceleration.z;
+	}
+	p->accelerometer_integral_dt = dt_us;
+
+	p->accelerometer_clipping   = 0;
+	p->gyro_clipping            = 0;
+	p->accel_calibration_count  = 0;
+	p->gyro_calibration_count   = 0;
+}
+
+/* Reject the first sample (dt=0) and any with a zero integration window;
+ * EKF2 forms rates from integral_dt and a zero window is unusable. */
+static bool sensor_combined_valid(const px4_msgs_c_SensorCombined_t *p)
+{
+	return p->gyro_integral_dt > 0U && p->accelerometer_integral_dt > 0U;
+}
+#endif
+
 /* -------- topic table row -------- */
 
 struct tx_row {
@@ -486,6 +561,22 @@ static int enc_mag_thunk(struct ucdrBuffer *ub, const void *p)
 	return px4_msgs_c_encode_sensor_mag(ub, (const px4_msgs_c_SensorMag_t *)p);
 }
 #endif
+#if BRIDGE_TX_SENSOR_COMBINED
+static void map_imu_thunk(const void *z, void *p)
+{
+	map_sensor_combined((const synapse_pb_Imu *)z,
+			    (px4_msgs_c_SensorCombined_t *)p);
+}
+static int enc_imu_thunk(struct ucdrBuffer *ub, const void *p)
+{
+	return px4_msgs_c_encode_sensor_combined(ub,
+			(const px4_msgs_c_SensorCombined_t *)p);
+}
+static bool valid_imu_thunk(const void *p)
+{
+	return sensor_combined_valid((const px4_msgs_c_SensorCombined_t *)p);
+}
+#endif
 
 #if BRIDGE_TX_COUNT > 0
 static struct tx_row tx_table[] = {
@@ -551,6 +642,22 @@ static struct tx_row tx_table[] = {
 		.rate_hz    = CONFIG_SYNAPSE_ZENOH_PX4_MAG_RATE_HZ,
 	},
 #endif
+#if BRIDGE_TX_SENSOR_COMBINED
+	{
+		.ztopic     = &topic_imu0,
+		.zbuf       = &g_ctx.z_imu,
+		.pbuf       = &g_ctx.p_imu,
+		.cdr_buf    = g_ctx.cdr_imu,
+		.cdr_size   = sizeof(g_ctx.cdr_imu),
+		.map_fn     = map_imu_thunk,
+		.encode_fn  = enc_imu_thunk,
+		.valid_fn   = valid_imu_thunk,
+		.topic_leaf = PX4_MSGS_C_TOPIC_SENSOR_COMBINED,
+		.ros_type   = PX4_MSGS_C_ROS_TYPE_SENSOR_COMBINED,
+		.rihs_hash  = PX4_MSGS_C_RIHS_SENSOR_COMBINED,
+		.rate_hz    = CONFIG_SYNAPSE_ZENOH_PX4_SENSOR_COMBINED_RATE_HZ,
+	},
+#endif
 };
 BUILD_ASSERT(ARRAY_SIZE(tx_table) == BRIDGE_TX_COUNT);
 static struct zros_sub tx_subs[BRIDGE_TX_COUNT];
@@ -570,6 +677,10 @@ BUILD_ASSERT(CDR_BUF_MAX >= PX4_MSGS_C_SENSOR_GPS_CDR_MAX,
 #if BRIDGE_TX_SENSOR_MAG
 BUILD_ASSERT(CDR_BUF_MAX >= PX4_MSGS_C_SENSOR_MAG_CDR_MAX,
 	     "CDR_BUF_MAX too small for SensorMag");
+#endif
+#if BRIDGE_TX_SENSOR_COMBINED
+BUILD_ASSERT(CDR_BUF_MAX >= PX4_MSGS_C_SENSOR_COMBINED_CDR_MAX,
+	     "CDR_BUF_MAX too small for SensorCombined");
 #endif
 #endif /* BRIDGE_TX_COUNT > 0 */
 
