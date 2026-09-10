@@ -58,8 +58,19 @@ LOG_MODULE_REGISTER(synapse_zenoh_px4, CONFIG_SYNAPSE_ZENOH_PX4_LOG_LEVEL);
  * considered dead and an automatic reconnect is attempted. This matters in
  * client mode: if the TCP link to the router drops, zenoh-pico tears down the
  * transport and every subsequent put fails until the session is reopened.
+ *
+ * With BEST_EFFORT + DROP congestion control (see declare_publishers) a put no
+ * longer fails on mere back-pressure, so a high count now genuinely indicates a
+ * dead transport rather than a busy one. Keep it generous to avoid tearing down
+ * a live session over a transient blip.
  */
-#define PUT_FAIL_LIMIT 10
+#define PUT_FAIL_LIMIT 60
+
+/* Minimum time between reconnect attempts (ms). Without this the loop can
+ * reconnect many times per second, which never lets the far side (rmw_zenoh /
+ * RViz) re-discover the liveliness graph -> RViz freezes and never recovers.
+ * A cooldown gives the transport time to actually re-establish and be used. */
+#define RECONNECT_COOLDOWN_MS 3000
 
 /* Optical-flow producer metadata (PAA3905 / AFBR-S50). These are sensor
  * datasheet constants used by EKF2 for gating; confirm against the parts fitted.
@@ -936,6 +947,13 @@ static int declare_publishers(struct context *ctx)
 			return -EINVAL;
 		}
 		z_publisher_options_default(&opts);
+		/* High-rate sensor streams must fail SOFT under back-pressure: drop the
+		 * sample instead of blocking/erroring (which would otherwise trip the
+		 * reconnect logic and storm). BEST_EFFORT + DROP is the right policy for
+		 * telemetry; a lost IMU/flow sample is harmless, a reconnect storm is not.
+		 * (PX4's own zenoh module uses the same knobs per-topic.) */
+		opts.reliability = Z_RELIABILITY_BEST_EFFORT;
+		opts.congestion_control = Z_CONGESTION_CONTROL_DROP;
 		if (z_encoding_from_str(&enc, CDR_ENCODING_STR) == 0) {
 			opts.encoding = z_move(enc);
 		}
@@ -1127,6 +1145,7 @@ static void bridge_run(void *p0, void *p1, void *p2)
 #if BRIDGE_TX_COUNT > 0
 	struct k_poll_event events[ARRAY_SIZE(tx_table)];
 	unsigned int put_fails = 0;
+	int64_t last_reconnect_ms = 0; /* uptime of last reconnect attempt */
 
 	for (size_t i = 0; i < ARRAY_SIZE(tx_table); i++) {
 		events[i] = *zros_sub_get_event(&tx_subs[i]);
@@ -1162,10 +1181,25 @@ static void bridge_run(void *p0, void *p1, void *p2)
 		}
 
 		if (put_fails >= PUT_FAIL_LIMIT) {
-			if (bridge_reconnect(ctx) < 0) {
-				break;
+			/* Rate-limit reconnects: a storm of teardown/reopen never lets
+			 * the far side re-discover the graph. Only actually reconnect
+			 * once per cooldown; otherwise back off and keep trying puts so
+			 * a transient recovers on its own without a session churn. */
+			int64_t now_ms = k_uptime_get();
+
+			if ((now_ms - last_reconnect_ms) >= RECONNECT_COOLDOWN_MS) {
+				last_reconnect_ms = now_ms;
+				if (bridge_reconnect(ctx) < 0) {
+					break;
+				}
+				put_fails = 0;
+			} else {
+				/* within cooldown: don't churn the session. Clamp the
+				 * counter just below the limit so we re-evaluate next
+				 * iteration instead of reconnecting every loop. */
+				put_fails = PUT_FAIL_LIMIT - 1;
+				k_sleep(K_MSEC(POLL_MS));
 			}
-			put_fails = 0;
 		}
 #else
 		k_sleep(K_MSEC(POLL_MS));
