@@ -17,7 +17,7 @@ manifest:
     - name: zephyr-rtos
       remote: nxp
       west-commands: scripts/west-commands.yml
-      revision: ffd99afea7fedf129e4e3160865d87fdb5733e4b # 	boards: nxp: mr-mcxn-t1 add storage partition for nvs
+      revision: 19ecb4d981990310262f908e221a5b01ee47687b
       path: zephyr
       import:
         - name-allowlist:
@@ -51,9 +51,9 @@ manifest:
       path: modules/lib/zros_drivers
     - name: zenoh-pico
       url: https://github.com/CogniPilot/zenoh-pico.git
-      revision: golden # PX4 CDR egress; TCP-only used here (no UDP-multicast/IPv6)
+      revision: caf1855f35c84962d6d8c8da7424ddf4ef1ec54a # PX4 CDR egress; TCP-only used here (no UDP-multicast/IPv6)
       path: modules/lib/zenoh-pico
     - name: microcdr
       url: https://github.com/eProsima/Micro-CDR.git
-      revision: v2.0.1
+      revision: 3d1b17703c7cf4f22def2910bc845bdb5152d7b5
       path: modules/lib/microcdr
