@@ -17,6 +17,13 @@
 #include <zephyr/shell/shell.h>
 #include <zephyr/sys/util.h>
 
+#if IS_ENABLED(CONFIG_SYNAPSE_ZENOH_PX4_PERSIST)
+#include <zephyr/device.h>
+#include <zephyr/drivers/flash.h>
+#include <zephyr/storage/flash_map.h>
+#include <zephyr/kvss/nvs.h>
+#endif
+
 #include <zros/private/zros_node_struct.h>
 #include <zros/private/zros_pub_struct.h>
 #include <zros/private/zros_sub_struct.h>
@@ -194,6 +201,100 @@ static struct zpx4_run_cfg g_run_cfg = {
 	.mode = ZPX4_MODE_CLIENT,
 #endif
 };
+
+#if IS_ENABLED(CONFIG_SYNAPSE_ZENOH_PX4_PERSIST)
+
+/* Persisted config: a single packed record (mode + locator) written under one
+ * NVS id, so a save is one atomic write and a stale/short record is rejected.
+ */
+struct zpx4_persist {
+	uint8_t mode;
+	char    locator[ZPX4_LOCATOR_MAX];
+} __packed;
+
+/* NVS store on the board `storage_partition`, mirroring the kvss/nvs sample. */
+#define ZPX4_NVS_PARTITION      storage_partition
+#define ZPX4_NVS_DEVICE         PARTITION_DEVICE(ZPX4_NVS_PARTITION)
+#define ZPX4_NVS_OFFSET         PARTITION_OFFSET(ZPX4_NVS_PARTITION)
+#define ZPX4_NVS_SECTOR_COUNT   3U
+#define ZPX4_CFG_ID             1     /* NVS entry id for the config record */
+
+static struct nvs_fs g_nvs;
+static bool          g_nvs_ready;
+
+static bool zpx4_locator_ok(const char *loc)
+{
+	return strncmp(loc, "tcp/", 4) == 0 || strncmp(loc, "udp/", 4) == 0;
+}
+
+/* Mount the NVS file system on storage_partition. Returns 0 on success. */
+static int zpx4_nvs_mount(void)
+{
+	struct flash_pages_info info;
+	int rc;
+
+	if (g_nvs_ready) {
+		return 0;
+	}
+
+	g_nvs.flash_device = ZPX4_NVS_DEVICE;
+	if (!device_is_ready(g_nvs.flash_device)) {
+		LOG_WRN("persist: flash device not ready");
+		return -ENODEV;
+	}
+	g_nvs.offset = ZPX4_NVS_OFFSET;
+	rc = flash_get_page_info_by_offs(g_nvs.flash_device, g_nvs.offset, &info);
+	if (rc) {
+		LOG_WRN("persist: page info failed (%d)", rc);
+		return rc;
+	}
+	g_nvs.sector_size = info.size;
+	g_nvs.sector_count = ZPX4_NVS_SECTOR_COUNT;
+
+	rc = nvs_mount(&g_nvs);
+	if (rc) {
+		LOG_WRN("persist: nvs_mount failed (%d)", rc);
+		return rc;
+	}
+	g_nvs_ready = true;
+	return 0;
+}
+
+/* Load persisted config (if any) into g_run_cfg. Runs before the bridge is
+ * auto-started so the stored config becomes the power-on config. If nothing is
+ * stored, or the record is invalid, g_run_cfg keeps its build-time defaults.
+ */
+static void zpx4_persist_load(void)
+{
+	struct zpx4_persist rec;
+	ssize_t rc;
+
+	if (zpx4_nvs_mount() != 0) {
+		return;
+	}
+
+	rc = nvs_read(&g_nvs, ZPX4_CFG_ID, &rec, sizeof(rec));
+	if (rc != (ssize_t)sizeof(rec)) {
+		/* rc <= 0: no record -> keep defaults. rc != size: stale layout. */
+		return;
+	}
+	if (rec.mode > ZPX4_MODE_CLIENT) {
+		LOG_WRN("persist: bad stored mode, using defaults");
+		return;
+	}
+	rec.locator[sizeof(rec.locator) - 1] = '\0';
+	if (!zpx4_locator_ok(rec.locator)) {
+		LOG_WRN("persist: invalid stored locator, using defaults");
+		return;
+	}
+
+	g_run_cfg.mode = rec.mode;
+	(void)snprintf(g_run_cfg.locator, sizeof(g_run_cfg.locator), "%s", rec.locator);
+	LOG_INF("persist: loaded %s %s",
+		g_run_cfg.mode == ZPX4_MODE_PEER ? "peer" : "client", g_run_cfg.locator);
+}
+
+#endif /* CONFIG_SYNAPSE_ZENOH_PX4_PERSIST */
 
 #endif /* CONFIG_SYNAPSE_ZENOH_PX4_RUNTIME_CONFIG */
 
@@ -1273,6 +1374,69 @@ static int cmd_config_show(const struct shell *sh, size_t argc, char **argv)
 	return 0;
 }
 
+#if IS_ENABLED(CONFIG_SYNAPSE_ZENOH_PX4_PERSIST)
+
+static int cmd_config_save(const struct shell *sh, size_t argc, char **argv)
+{
+	ARG_UNUSED(argc);
+	ARG_UNUSED(argv);
+
+	/* Persisting erases/programs the internal flash the CPU runs from (XIP),
+	 * which briefly stalls the core. Require the bridge stopped so the save
+	 * cannot disturb a live zenoh session.
+	 */
+	if (k_sem_count_get(&g_ctx.running) == 0) {
+		shell_error(sh,
+			    "bridge is running; run `zenoh_px4 stop` before `config save`");
+		return -EBUSY;
+	}
+	if (!zpx4_locator_ok(g_run_cfg.locator)) {
+		shell_error(sh, "refusing to save invalid locator '%s'", g_run_cfg.locator);
+		return -EINVAL;
+	}
+	if (zpx4_nvs_mount() != 0) {
+		shell_error(sh, "storage not available");
+		return -EIO;
+	}
+
+	struct zpx4_persist rec = {
+		.mode = g_run_cfg.mode,
+	};
+	(void)snprintf(rec.locator, sizeof(rec.locator), "%s", g_run_cfg.locator);
+
+	ssize_t rc = nvs_write(&g_nvs, ZPX4_CFG_ID, &rec, sizeof(rec));
+
+	if (rc < 0) {
+		shell_error(sh, "save failed (%d)", (int)rc);
+		return (int)rc;
+	}
+	shell_print(sh, "saved (%s %s); reboot or `restart` to apply",
+		    rec.mode == ZPX4_MODE_PEER ? "peer" : "client", rec.locator);
+	return 0;
+}
+
+static int cmd_config_clear(const struct shell *sh, size_t argc, char **argv)
+{
+	ARG_UNUSED(argc);
+	ARG_UNUSED(argv);
+
+	if (zpx4_nvs_mount() != 0) {
+		shell_error(sh, "storage not available");
+		return -EIO;
+	}
+
+	int rc = nvs_delete(&g_nvs, ZPX4_CFG_ID);
+
+	if (rc) {
+		shell_error(sh, "clear failed (%d)", rc);
+		return rc;
+	}
+	shell_print(sh, "cleared; build defaults restored on next boot");
+	return 0;
+}
+
+#endif /* CONFIG_SYNAPSE_ZENOH_PX4_PERSIST */
+
 static int cmd_restart(const struct shell *sh, size_t argc, char **argv)
 {
 	ARG_UNUSED(argc);
@@ -1294,6 +1458,12 @@ SHELL_STATIC_SUBCMD_SET_CREATE(sub_config_net,
 SHELL_STATIC_SUBCMD_SET_CREATE(sub_config,
 	SHELL_CMD(net, &sub_config_net, "set net mode + locator", NULL),
 	SHELL_CMD(show, NULL, "show staged/active config", cmd_config_show),
+#if IS_ENABLED(CONFIG_SYNAPSE_ZENOH_PX4_PERSIST)
+	SHELL_CMD(save, NULL, "persist config to flash (bridge must be stopped)",
+		  cmd_config_save),
+	SHELL_CMD(clear, NULL, "erase persisted config (revert to defaults)",
+		  cmd_config_clear),
+#endif
 	SHELL_SUBCMD_SET_END);
 
 static int cmd_start(const struct shell *sh, size_t argc, char **argv)
@@ -1367,6 +1537,10 @@ SHELL_CMD_REGISTER(zenoh_px4, &sub_zenoh_px4, "PX4 zenoh CDR egress", NULL);
 
 static int zenoh_px4_sys_init(void)
 {
+#if IS_ENABLED(CONFIG_SYNAPSE_ZENOH_PX4_PERSIST)
+	/* Load saved config (or keep build defaults) before the bridge starts. */
+	zpx4_persist_load();
+#endif
 	return start(&g_ctx);
 }
 

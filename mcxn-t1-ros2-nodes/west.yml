@@ -17,7 +17,7 @@ manifest:
     - name: zephyr-rtos
       remote: nxp
       west-commands: scripts/west-commands.yml
-      revision: devel
+      revision: ffd99afea7fedf129e4e3160865d87fdb5733e4b # 	boards: nxp: mr-mcxn-t1 add storage partition for nvs
       path: zephyr
       import:
         - name-allowlist:

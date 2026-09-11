@@ -98,16 +98,41 @@ config SYNAPSE_ZENOH_PX4_RUNTIME_CONFIG
 	  power-on defaults. Changes are staged in RAM and applied on the next
 	  session open (explicit `restart`, not live).
 
-	  The runtime config is NOT persisted: a `config net` override is lost on
-	  reboot and the build defaults are restored. (An earlier revision saved
-	  it to NVS, but writing to the internal flash the CPU executes from
-	  stalled the shell thread on the XIP MCXN target during the flash
-	  program/erase, so persistence was removed.)
+	  Runtime changes are RAM-only unless SYNAPSE_ZENOH_PX4_PERSIST is set
+	  (see below), in which case `zenoh_px4 config save` persists them to
+	  flash and they are reloaded on boot.
 
 	  NOTE the peer-mode semantic caveat: unlike PX4, where `net peer
 	  <ip>:<port>` is the REMOTE connect target, here peer mode makes the node
 	  the LISTENER, so the <ip>:<port> is this node's LOCAL bind/listen address
 	  (e.g. 0.0.0.0:7447). Client mode matches PX4: it is the remote router.
+
+config SYNAPSE_ZENOH_PX4_PERSIST
+	bool "Persist runtime net config to flash (config save/clear)"
+	depends on SYNAPSE_ZENOH_PX4_RUNTIME_CONFIG
+	default n
+	select NVS
+	select FLASH
+	select FLASH_MAP
+	select MPU_ALLOW_FLASH_WRITE
+	help
+	  Store the runtime net mode + locator as a single packed record in the
+	  board `storage_partition` using the NVS API directly (nvs_mount /
+	  nvs_read / nvs_write / nvs_delete), so it survives reboot. Adds:
+
+	    zenoh_px4 config save     persist the current staged config to flash
+	    zenoh_px4 config clear    erase the stored config (revert to defaults)
+
+	  On boot the stored config is loaded before the bridge starts; if no
+	  record exists (or it is invalid) the build-time MODE_*/LOCATOR defaults
+	  are used.
+
+	  `config save` is refused unless the bridge is stopped (`zenoh_px4 stop`).
+	  Because the MCXN executes XIP from the same internal flash bank, the NVS
+	  write briefly stalls the core; requiring the bridge stopped keeps that
+	  one-off provisioning write from disturbing a live zenoh session. Do not
+	  run `config save` during active operation. Requires a board with a
+	  `storage_partition` (see the mr-mcxn-t1 NVS storage partition).
 
 config SYNAPSE_ZENOH_PX4_DOMAIN_ID
 	int "Zenoh/ROS2 domain id (must match PX4's ZENOH_DOMAIN_ID param)"
