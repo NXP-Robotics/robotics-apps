@@ -25,7 +25,7 @@
 #define PX4_MSGS_C_RIHS_DISTANCE_SENSOR                                                            \
 	"RIHS01_a8457d649dbcc726dce2558cf8a5732dc0b74d518bdb5e89248c0c515e8f80f5"
 #define PX4_MSGS_C_RIHS_SENSOR_GPS                                                                 \
-	"RIHS01_0b0f92e680bbcad0c9d0e651868c0443b9d38fb8d50c21d4a8a532d3e90cf21a"
+	"RIHS01_fbef1acd7734fab29377906ae90f6493e9a07724a6a21997fb8fd51d6771b958"
 #define PX4_MSGS_C_RIHS_SENSOR_MAG                                                                 \
 	"RIHS01_217da8c1190f1ac948c3a5abe4e7489412655fc24f2dc93c51fa5087e5140d89"
 #define PX4_MSGS_C_RIHS_SENSOR_COMBINED                                                            \
